@@ -56,6 +56,31 @@ groups
 ls -l /dev/ttyS0 /dev/ttyUSB0
 ```
 
+当前 Kylin 机器已确认：
+
+```text
+内核：4.19.90-89.11.v2401.ky10.x86_64
+GCC/G++：7.3.0
+CMake：3.16.5
+Qt5Core/Qt5Widgets/Qt5SerialPort：5.11.1
+qmake：未安装
+串口设备组：dialout
+当前用户组：zhe wheel
+```
+
+`qmake` 缺失不影响当前工程，因为本工程使用 CMake 构建。只要 `cmake -S . -B build`
+能找到 `Qt5Widgets` 和 `Qt5SerialPort` 即可。
+
+串口权限需要处理。当前 `/dev/ttyS*` 权限是 `root:dialout`，而用户 `zhe` 还不在
+`dialout` 组，直接打开串口会失败。建议执行：
+
+```sh
+sudo usermod -aG dialout zhe
+```
+
+执行后需要退出当前桌面/终端会话并重新登录，再用 `groups` 确认输出里包含 `dialout`。
+如果只是临时验证，也可以先用 `sudo ./build/pa_host` 运行，但正式使用不建议依赖 root 权限。
+
 ## 编译运行
 
 ```sh

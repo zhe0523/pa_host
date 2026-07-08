@@ -34,7 +34,8 @@ cmake --build build -j
 ./build/pa_host
 ```
 
-当前这台机器暂时没有 `cmake`、`qmake` 和 Qt 开发包，所以这里只先建立工程结构，编译验证留到 Kylin 环境安装完成后继续。
+当前工程使用 CMake 构建，`qmake` 不是必须项。Kylin 上如果 `pkg-config --modversion Qt5Core Qt5Widgets Qt5SerialPort`
+能看到版本号，可以先直接尝试 CMake 构建。
 
 ## 与 ARM 的当前协议
 
