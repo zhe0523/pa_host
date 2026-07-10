@@ -2,55 +2,254 @@
 
 #include <QAction>
 #include <QBoxLayout>
+#include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
+#include <QDebug>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QFormLayout>
 #include <QGridLayout>
 #include <QGroupBox>
+#include <QGuiApplication>
+#include <QKeySequence>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPainter>
 #include <QPushButton>
+#include <QScreen>
 #include <QSerialPortInfo>
+#include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QSlider>
 #include <QSplitter>
 #include <QStatusBar>
-#include <QToolButton>
+#include <QWidgetAction>
+
+#include <algorithm>
+#include <cmath>
 
 namespace {
+QSize initialWindowSize() {
+    auto* screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        return {1180, 720};
+    }
+
+    const QSize available = screen->availableGeometry().size();
+    return {
+        std::max(1180, std::min(1320, static_cast<int>(available.width() * 0.92))),
+        std::max(820, std::min(900, static_cast<int>(available.height() * 0.92))),
+    };
+}
+
 QPushButton* makeCommandButton(const QString& text) {
     auto* button = new QPushButton(text);
-    button->setMinimumHeight(30);
+    button->setMinimumHeight(26);
+    button->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     return button;
+}
+
+void populateSerialPorts(QComboBox* combo) {
+    combo->clear();
+    for (const QSerialPortInfo& info : QSerialPortInfo::availablePorts()) {
+        combo->addItem(info.systemLocation());
+    }
+    if (combo->count() == 0) {
+        combo->addItems({QStringLiteral("/dev/ttyS0"), QStringLiteral("/dev/ttyS1"), QStringLiteral("/dev/ttyUSB0")});
+    }
+}
+
+QVector<double> columnProfile(const TiRawImage& image, const QRect& rect) {
+    QVector<double> profile;
+    profile.reserve(rect.width());
+    for (int x = rect.left(); x <= rect.right(); ++x) {
+        double sum = 0.0;
+        for (int y = rect.top(); y <= rect.bottom(); ++y) {
+            quint16 value = 0;
+            image.pixelValue(x, y, &value);
+            sum += value;
+        }
+        profile.push_back(sum / rect.height());
+    }
+    return profile;
+}
+
+QVector<double> derivativeProfile(const QVector<double>& values) {
+    QVector<double> result;
+    if (values.size() < 2) {
+        return result;
+    }
+    result.reserve(values.size() - 1);
+    for (int i = 1; i < values.size(); ++i) {
+        result.push_back(values.at(i) - values.at(i - 1));
+    }
+    return result;
+}
+
+QVector<double> mtfProfile(const QVector<double>& lsf) {
+    QVector<double> result;
+    const int n = lsf.size();
+    if (n < 2) {
+        return result;
+    }
+
+    const int bins = std::min(160, n / 2);
+    result.reserve(bins);
+    double dc = 0.0;
+    for (const double value : lsf) {
+        dc += std::abs(value);
+    }
+    if (dc <= 0.0) {
+        dc = 1.0;
+    }
+
+    constexpr double pi = 3.14159265358979323846;
+    for (int k = 0; k < bins; ++k) {
+        double real = 0.0;
+        double imag = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double angle = -2.0 * pi * k * i / n;
+            real += lsf.at(i) * std::cos(angle);
+            imag += lsf.at(i) * std::sin(angle);
+        }
+        result.push_back(std::sqrt(real * real + imag * imag) * 100.0 / dc);
+    }
+    return result;
+}
+
+QPixmap drawAnalysisPreview(const QImage& image, const QRect& roi, const QSize& size) {
+    QPixmap pixmap(size);
+    pixmap.fill(QColor(8, 9, 10));
+
+    if (image.isNull()) {
+        return pixmap;
+    }
+
+    const QSize scaledSize = image.size().scaled(size, Qt::KeepAspectRatio);
+    const QRect targetRect(
+        (size.width() - scaledSize.width()) / 2,
+        (size.height() - scaledSize.height()) / 2,
+        scaledSize.width(),
+        scaledSize.height());
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    painter.drawImage(targetRect, image);
+
+    const qreal scaleX = static_cast<qreal>(targetRect.width()) / image.width();
+    const qreal scaleY = static_cast<qreal>(targetRect.height()) / image.height();
+    const QRectF roiRect(
+        targetRect.left() + roi.left() * scaleX,
+        targetRect.top() + roi.top() * scaleY,
+        roi.width() * scaleX,
+        roi.height() * scaleY);
+    painter.setPen(QPen(QColor(255, 110, 0), 1.2));
+    painter.drawRect(roiRect);
+    return pixmap;
+}
+
+QPixmap drawLineChart(
+    const QString& title,
+    const QString& yLabel,
+    const QString& xLabel,
+    const QVector<double>& values,
+    const QSize& size) {
+    QPixmap pixmap(size);
+    pixmap.fill(Qt::white);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    const QRect plotRect(56, 28, size.width() - 72, size.height() - 62);
+    painter.setPen(QColor(25, 31, 37));
+    QFont titleFont = painter.font();
+    titleFont.setBold(true);
+    painter.setFont(titleFont);
+    painter.drawText(QRect(0, 4, size.width(), 20), Qt::AlignCenter, title);
+
+    painter.setFont(QFont());
+    painter.setPen(QColor(230, 235, 240));
+    for (int i = 0; i <= 5; ++i) {
+        const int x = plotRect.left() + plotRect.width() * i / 5;
+        painter.drawLine(x, plotRect.top(), x, plotRect.bottom());
+        const int y = plotRect.top() + plotRect.height() * i / 5;
+        painter.drawLine(plotRect.left(), y, plotRect.right(), y);
+    }
+
+    painter.setPen(QColor(30, 35, 40));
+    painter.drawRect(plotRect);
+
+    if (!values.isEmpty()) {
+        auto range = std::minmax_element(values.begin(), values.end());
+        double minValue = *range.first;
+        double maxValue = *range.second;
+        if (maxValue <= minValue) {
+            maxValue = minValue + 1.0;
+        }
+
+        QPolygonF polyline;
+        polyline.reserve(values.size());
+        for (int i = 0; i < values.size(); ++i) {
+            const qreal x = plotRect.left() + (values.size() == 1 ? 0.0 : plotRect.width() * static_cast<qreal>(i) / (values.size() - 1));
+            const qreal normalized = (values.at(i) - minValue) / (maxValue - minValue);
+            const qreal y = plotRect.bottom() - normalized * plotRect.height();
+            polyline << QPointF(x, y);
+        }
+        painter.setPen(QPen(QColor(31, 119, 180), 1.0));
+        painter.drawPolyline(polyline);
+
+        painter.setPen(QColor(60, 67, 75));
+        painter.drawText(4, plotRect.top() + 4, QString::number(maxValue, 'f', 0));
+        painter.drawText(4, plotRect.bottom(), QString::number(minValue, 'f', 0));
+    }
+
+    painter.setPen(QColor(25, 31, 37));
+    painter.drawText(QRect(plotRect.left(), size.height() - 24, plotRect.width(), 18), Qt::AlignCenter, xLabel);
+
+    painter.save();
+    painter.translate(14, plotRect.center().y());
+    painter.rotate(-90);
+    painter.drawText(QRect(-plotRect.height() / 2, 0, plotRect.height(), 18), Qt::AlignCenter, yLabel);
+    painter.restore();
+
+    return pixmap;
 }
 }
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent) {
     setWindowTitle(QStringLiteral("PA Host"));
-    resize(1500, 860);
+    setMinimumSize(1180, 820);
+    resize(initialWindowSize());
 
     createMenus();
 
     auto* root = new QWidget(this);
+    root->setObjectName(QStringLiteral("mainRoot"));
     auto* rootLayout = new QVBoxLayout(root);
-    rootLayout->setContentsMargins(6, 6, 6, 6);
-    rootLayout->setSpacing(6);
+    rootLayout->setContentsMargins(8, 8, 8, 8);
+    rootLayout->setSpacing(8);
 
-    rootLayout->addWidget(createTopBar());
+    topBar_ = createTopBar();
+    rootLayout->addWidget(topBar_);
 
     auto* splitter = new QSplitter(Qt::Horizontal, root);
-    splitter->addWidget(createImageListPanel());
+    imageListPanel_ = createImageListPanel();
+    splitter->addWidget(imageListPanel_);
 
     imageView_ = new ImageView(splitter);
+    imageView_->setObjectName(QStringLiteral("imageCanvas"));
     splitter->addWidget(imageView_);
-    splitter->addWidget(createRightPanel());
+    rightPanel_ = createRightPanel();
+    splitter->addWidget(rightPanel_);
     splitter->setStretchFactor(0, 0);
     splitter->setStretchFactor(1, 1);
     splitter->setStretchFactor(2, 0);
-    splitter->setSizes({170, 1080, 300});
+    splitter->setChildrenCollapsible(false);
+    splitter->setSizes({165, 960, 285});
     rootLayout->addWidget(splitter, 1);
 
     setCentralWidget(root);
@@ -64,13 +263,23 @@ MainWindow::MainWindow(QWidget* parent)
     connect(imageView_, &ImageView::zoomChanged, this, [this](int percent) {
         progressLabel_->setText(QStringLiteral("缩放: %1%").arg(percent));
     });
+    connect(imageView_, &ImageView::pixelHovered, this, &MainWindow::updatePixelInfo);
+    connect(imageView_, &ImageView::analysisRoiSelected, this, &MainWindow::handleAnalysisRoi);
+    connect(imageView_, &ImageView::windowLevelRoiSelected, this, &MainWindow::applyWindowLevelFromRoi);
+    connect(imageView_, &ImageView::roiCleared, this, &MainWindow::updateFullImageInfo);
+    imageRefreshTimer_.setSingleShot(true);
+    imageRefreshTimer_.setInterval(35);
+    connect(&imageRefreshTimer_, &QTimer::timeout, this, [this]() {
+        refreshImage(resetViewStateOnRefresh_);
+        resetViewStateOnRefresh_ = false;
+    });
 }
 
 void MainWindow::openImage() {
     const QString path = QFileDialog::getOpenFileName(
         this,
         QStringLiteral("打开 TiRaw 图像"),
-        QStringLiteral("/home/zhe/sdk/app/windows/tidetector/CollectImage"),
+        QStringLiteral("/home/zhe/app/windows/tidetector/CollectImage"),
         QStringLiteral("TiRayRaw (*.tiraw);;All Files (*)"));
     if (path.isEmpty()) {
         return;
@@ -87,13 +296,21 @@ void MainWindow::openImage() {
     imageList_->addItem(QFileInfo(path).fileName());
     imageList_->setCurrentRow(imageList_->count() - 1);
     imageLabel_->setText(QStringLiteral("%1 x %2").arg(currentRaw_.width()).arg(currentRaw_.height()));
-    appendLog(QStringLiteral("打开图像: %1, %2x%3, min=%4 max=%5")
+    if (pixelInfoLabel_ != nullptr) {
+        pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
+    }
+    if (roiInfoLabel_ != nullptr) {
+        updateFullImageInfo();
+    }
+    appendLog(QStringLiteral("打开图像: %1, %2x%3, min=%4 max=%5, auto center=%6 width=%7")
                   .arg(path)
                   .arg(currentRaw_.width())
                   .arg(currentRaw_.height())
                   .arg(currentRaw_.minValue())
-                  .arg(currentRaw_.maxValue()));
-    refreshImage();
+                  .arg(currentRaw_.maxValue())
+                  .arg(currentRaw_.autoWindowCenter())
+                  .arg(currentRaw_.autoWindowWidth()));
+    refreshImage(true);
 }
 
 void MainWindow::saveDisplayImage() {
@@ -143,21 +360,6 @@ void MainWindow::sendCommand(PaProtocol::Command command) {
     appendLog(QStringLiteral("TX: %1").arg(text));
 }
 
-void MainWindow::sendCustomCommand() {
-    const QString text = customCommandEdit_->text().trimmed();
-    if (text.isEmpty()) {
-        return;
-    }
-
-    QString error;
-    if (!serial_.sendLine(text, &error)) {
-        appendLog(QStringLiteral("发送失败: %1, %2").arg(text, error));
-        return;
-    }
-    appendLog(QStringLiteral("TX: %1").arg(text));
-    customCommandEdit_->clear();
-}
-
 void MainWindow::handleLineReceived(const QString& line) {
     appendLog(QStringLiteral("RX: %1").arg(line));
     updateStatusFromResponse(PaProtocol::parseResponse(line));
@@ -174,13 +376,39 @@ void MainWindow::updateWindowLevel() {
     if (widthSlider_->value() != widthSpin_->value()) {
         widthSpin_->setValue(widthSlider_->value());
     }
-    refreshImage();
+    if (!autoWindowCheck_->isChecked()) {
+        scheduleImageRefresh(false);
+    }
+}
+
+void MainWindow::toggleImageMaximized() {
+    imageMaximized_ = !imageMaximized_;
+
+    if (topBar_ != nullptr) {
+        topBar_->setVisible(!imageMaximized_);
+    }
+    if (imageListPanel_ != nullptr) {
+        imageListPanel_->setVisible(!imageMaximized_);
+    }
+    if (rightPanel_ != nullptr) {
+        rightPanel_->setVisible(!imageMaximized_);
+    }
+    if (imageMaximizeAction_ != nullptr) {
+        imageMaximizeAction_->setChecked(imageMaximized_);
+        imageMaximizeAction_->setText(imageMaximized_
+                                          ? QStringLiteral("退出图像最大化")
+                                          : QStringLiteral("图像最大化"));
+    }
+    if (imageView_ != nullptr && imageView_->hasImage()) {
+        imageView_->fitToWindow();
+    }
 }
 
 QWidget* MainWindow::createTopBar() {
     auto* bar = new QWidget(this);
+    bar->setObjectName(QStringLiteral("topBar"));
     auto* layout = new QHBoxLayout(bar);
-    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setContentsMargins(10, 8, 10, 8);
     layout->setSpacing(8);
 
     auto* idleButton = new QPushButton(QStringLiteral("Idle"), bar);
@@ -191,6 +419,15 @@ QWidget* MainWindow::createTopBar() {
     idleButton->setCheckable(true);
     idleButton->setChecked(true);
     continuousButton->setCheckable(true);
+    idleButton->setProperty("role", "mode");
+    continuousButton->setProperty("role", "mode");
+    manualButton->setProperty("role", "primary");
+    stopButton->setProperty("role", "stop");
+
+    auto* modeGroup = new QButtonGroup(bar);
+    modeGroup->setExclusive(true);
+    modeGroup->addButton(idleButton);
+    modeGroup->addButton(continuousButton);
 
     connect(manualButton, &QPushButton::clicked, this, [this]() {
         sendCommand(PaProtocol::Command::SendImage);
@@ -211,113 +448,41 @@ QWidget* MainWindow::createTopBar() {
 
 QWidget* MainWindow::createImageListPanel() {
     auto* group = new QGroupBox(QStringLiteral("图像列表"), this);
+    group->setObjectName(QStringLiteral("imageListPanel"));
+    group->setMinimumWidth(150);
+    group->setMaximumWidth(260);
+    group->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
     auto* layout = new QVBoxLayout(group);
     imageList_ = new QListWidget(group);
-    imageList_->setMinimumWidth(150);
+    imageList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     layout->addWidget(imageList_);
     return group;
 }
 
 QWidget* MainWindow::createRightPanel() {
     auto* panel = new QWidget(this);
+    panel->setObjectName(QStringLiteral("rightPanel"));
+    panel->setMinimumWidth(270);
+    panel->setMaximumWidth(340);
+    panel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+
     auto* layout = new QVBoxLayout(panel);
     layout->setContentsMargins(6, 0, 0, 0);
-    layout->setSpacing(8);
-
-    layout->addWidget(createSerialPanel());
-    layout->addWidget(createCommandPanel());
+    layout->setSpacing(6);
     layout->addWidget(createImageOpsPanel());
     layout->addWidget(createWindowLevelPanel());
-
-    logView_ = new QTextEdit(panel);
-    logView_->setReadOnly(true);
-    logView_->setMinimumHeight(150);
-    layout->addWidget(logView_, 1);
+    layout->addWidget(createImageInfoPanel());
+    layout->addStretch(1);
 
     return panel;
-}
-
-QWidget* MainWindow::createSerialPanel() {
-    auto* group = new QGroupBox(QStringLiteral("RS422 通讯"), this);
-    auto* layout = new QGridLayout(group);
-
-    portCombo_ = new QComboBox(group);
-    for (const QSerialPortInfo& info : QSerialPortInfo::availablePorts()) {
-        portCombo_->addItem(info.systemLocation());
-    }
-    if (portCombo_->count() == 0) {
-        portCombo_->addItems({QStringLiteral("/dev/ttyS0"), QStringLiteral("/dev/ttyS1"), QStringLiteral("/dev/ttyUSB0")});
-    }
-
-    baudSpin_ = new QSpinBox(group);
-    baudSpin_->setRange(1200, 3000000);
-    baudSpin_->setValue(115200);
-
-    auto* connectButton = new QPushButton(QStringLiteral("连接"), group);
-    auto* disconnectButton = new QPushButton(QStringLiteral("断开"), group);
-    connect(connectButton, &QPushButton::clicked, this, &MainWindow::connectSerial);
-    connect(disconnectButton, &QPushButton::clicked, this, &MainWindow::disconnectSerial);
-
-    layout->addWidget(new QLabel(QStringLiteral("端口")), 0, 0);
-    layout->addWidget(portCombo_, 0, 1, 1, 2);
-    layout->addWidget(new QLabel(QStringLiteral("波特率")), 1, 0);
-    layout->addWidget(baudSpin_, 1, 1, 1, 2);
-    layout->addWidget(connectButton, 2, 1);
-    layout->addWidget(disconnectButton, 2, 2);
-
-    return group;
-}
-
-QWidget* MainWindow::createCommandPanel() {
-    auto* group = new QGroupBox(QStringLiteral("PA/FPGA 控制"), this);
-    auto* layout = new QGridLayout(group);
-
-    struct ButtonSpec {
-        PaProtocol::Command command;
-        const char* text;
-    };
-
-    const ButtonSpec buttons[] = {
-        {PaProtocol::Command::Ping, "心跳"},
-        {PaProtocol::Command::Status, "读取状态"},
-        {PaProtocol::Command::LoadTemplate, "加载模板"},
-        {PaProtocol::Command::ConfigTemplate, "配置模板"},
-        {PaProtocol::Command::MakeOffset, "生成 Offset"},
-        {PaProtocol::Command::MakeGain, "生成 Gain"},
-        {PaProtocol::Command::StartCorrection, "启动校正"},
-        {PaProtocol::Command::SendImage, "通知传图"},
-        {PaProtocol::Command::WaitIrq, "等待中断"},
-    };
-
-    int row = 0;
-    int col = 0;
-    for (const ButtonSpec& spec : buttons) {
-        auto* button = makeCommandButton(QString::fromUtf8(spec.text));
-        connect(button, &QPushButton::clicked, this, [this, spec]() {
-            sendCommand(spec.command);
-        });
-        layout->addWidget(button, row, col);
-        col = (col + 1) % 2;
-        if (col == 0) {
-            ++row;
-        }
-    }
-
-    customCommandEdit_ = new QLineEdit(group);
-    customCommandEdit_->setPlaceholderText(QStringLiteral("手动命令，例如 STATUS"));
-    auto* sendButton = new QPushButton(QStringLiteral("发送"), group);
-    connect(sendButton, &QPushButton::clicked, this, &MainWindow::sendCustomCommand);
-    connect(customCommandEdit_, &QLineEdit::returnPressed, this, &MainWindow::sendCustomCommand);
-
-    layout->addWidget(customCommandEdit_, row + 1, 0);
-    layout->addWidget(sendButton, row + 1, 1);
-
-    return group;
 }
 
 QWidget* MainWindow::createImageOpsPanel() {
     auto* group = new QGroupBox(QStringLiteral("图像操作"), this);
     auto* layout = new QGridLayout(group);
+    layout->setContentsMargins(6, 6, 6, 6);
+    layout->setHorizontalSpacing(4);
+    layout->setVerticalSpacing(4);
 
     auto* rotateLeftButton = makeCommandButton(QStringLiteral("左转"));
     auto* rotateRightButton = makeCommandButton(QStringLiteral("右转"));
@@ -328,6 +493,7 @@ QWidget* MainWindow::createImageOpsPanel() {
     auto* fitButton = makeCommandButton(QStringLiteral("适应"));
     auto* resetButton = makeCommandButton(QStringLiteral("重置"));
     auto* saveButton = makeCommandButton(QStringLiteral("保存"));
+    auto* maximizeButton = makeCommandButton(QStringLiteral("最大化图像"));
 
     connect(rotateLeftButton, &QPushButton::clicked, imageView_, &ImageView::rotateLeft);
     connect(rotateRightButton, &QPushButton::clicked, imageView_, &ImageView::rotateRight);
@@ -338,6 +504,7 @@ QWidget* MainWindow::createImageOpsPanel() {
     connect(fitButton, &QPushButton::clicked, imageView_, &ImageView::fitToWindow);
     connect(resetButton, &QPushButton::clicked, imageView_, &ImageView::resetView);
     connect(saveButton, &QPushButton::clicked, this, &MainWindow::saveDisplayImage);
+    connect(maximizeButton, &QPushButton::clicked, this, &MainWindow::toggleImageMaximized);
 
     layout->addWidget(rotateLeftButton, 0, 0);
     layout->addWidget(rotateRightButton, 0, 1);
@@ -348,6 +515,7 @@ QWidget* MainWindow::createImageOpsPanel() {
     layout->addWidget(fitButton, 3, 0);
     layout->addWidget(resetButton, 3, 1);
     layout->addWidget(saveButton, 4, 0, 1, 2);
+    layout->addWidget(maximizeButton, 5, 0, 1, 2);
 
     return group;
 }
@@ -355,6 +523,9 @@ QWidget* MainWindow::createImageOpsPanel() {
 QWidget* MainWindow::createWindowLevelPanel() {
     auto* group = new QGroupBox(QStringLiteral("窗宽窗位"), this);
     auto* layout = new QGridLayout(group);
+    layout->setContentsMargins(6, 6, 6, 6);
+    layout->setHorizontalSpacing(4);
+    layout->setVerticalSpacing(4);
 
     autoWindowCheck_ = new QCheckBox(QStringLiteral("自动窗宽窗位"), group);
     autoWindowCheck_->setChecked(true);
@@ -373,7 +544,9 @@ QWidget* MainWindow::createWindowLevelPanel() {
     widthSpin_->setRange(1, 65535);
     widthSpin_->setValue(4096);
 
-    connect(autoWindowCheck_, &QCheckBox::toggled, this, &MainWindow::refreshImage);
+    connect(autoWindowCheck_, &QCheckBox::toggled, this, [this]() {
+        scheduleImageRefresh(false);
+    });
     connect(centerSlider_, &QSlider::valueChanged, this, &MainWindow::updateWindowLevel);
     connect(widthSlider_, &QSlider::valueChanged, this, &MainWindow::updateWindowLevel);
     connect(centerSpin_, QOverload<int>::of(&QSpinBox::valueChanged), centerSlider_, &QSlider::setValue);
@@ -390,6 +563,24 @@ QWidget* MainWindow::createWindowLevelPanel() {
     return group;
 }
 
+QWidget* MainWindow::createImageInfoPanel() {
+    auto* group = new QGroupBox(QStringLiteral("图像信息"), this);
+    auto* layout = new QVBoxLayout(group);
+    layout->setContentsMargins(6, 6, 6, 6);
+    layout->setSpacing(6);
+
+    pixelInfoLabel_ = new QLabel(QStringLiteral("像素值: --"), group);
+    pixelInfoLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    roiInfoLabel_ = new QLabel(QStringLiteral("ROI 信息: Ctrl+左键分析，Shift+左键重算窗宽窗位"), group);
+    roiInfoLabel_->setWordWrap(true);
+    roiInfoLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    layout->addWidget(pixelInfoLabel_);
+    layout->addWidget(roiInfoLabel_);
+    return group;
+}
+
 void MainWindow::createMenus() {
     auto* fileMenu = menuBar()->addMenu(QStringLiteral("文件"));
     auto* openAction = fileMenu->addAction(QStringLiteral("打开 TiRaw 图像"));
@@ -401,9 +592,62 @@ void MainWindow::createMenus() {
     connect(saveAction, &QAction::triggered, this, &MainWindow::saveDisplayImage);
     connect(quitAction, &QAction::triggered, this, &QWidget::close);
 
+    auto* serialMenu = menuBar()->addMenu(QStringLiteral("RS422"));
+    auto* portLabelAction = serialMenu->addAction(QStringLiteral("端口"));
+    portLabelAction->setEnabled(false);
+    portCombo_ = new QComboBox(serialMenu);
+    populateSerialPorts(portCombo_);
+    auto* portAction = new QWidgetAction(serialMenu);
+    portAction->setDefaultWidget(portCombo_);
+    serialMenu->addAction(portAction);
+
+    auto* baudLabelAction = serialMenu->addAction(QStringLiteral("波特率"));
+    baudLabelAction->setEnabled(false);
+    baudSpin_ = new QSpinBox(serialMenu);
+    baudSpin_->setRange(1200, 3000000);
+    baudSpin_->setValue(115200);
+    auto* baudAction = new QWidgetAction(serialMenu);
+    baudAction->setDefaultWidget(baudSpin_);
+    serialMenu->addAction(baudAction);
+
+    serialMenu->addSeparator();
+    serialMenu->addAction(QStringLiteral("刷新端口"), this, [this]() {
+        populateSerialPorts(portCombo_);
+    });
+    serialMenu->addAction(QStringLiteral("连接"), this, &MainWindow::connectSerial);
+    serialMenu->addAction(QStringLiteral("断开"), this, &MainWindow::disconnectSerial);
+
+    auto* commandMenu = menuBar()->addMenu(QStringLiteral("PA/FPGA"));
+    struct MenuCommand {
+        PaProtocol::Command command;
+        const char* text;
+    };
+    const MenuCommand commands[] = {
+        {PaProtocol::Command::Ping, "心跳"},
+        {PaProtocol::Command::Status, "读取状态"},
+        {PaProtocol::Command::LoadTemplate, "加载模板"},
+        {PaProtocol::Command::ConfigTemplate, "配置模板"},
+        {PaProtocol::Command::MakeOffset, "生成 Offset"},
+        {PaProtocol::Command::MakeGain, "生成 Gain"},
+        {PaProtocol::Command::StartCorrection, "启动校正"},
+        {PaProtocol::Command::SendImage, "手动上图"},
+        {PaProtocol::Command::WaitIrq, "等待中断"},
+        {PaProtocol::Command::Quit, "退出 ARM"},
+    };
+    for (const MenuCommand& item : commands) {
+        commandMenu->addAction(QString::fromUtf8(item.text), this, [this, item]() {
+            sendCommand(item.command);
+        });
+    }
+
+    auto* viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
+    imageMaximizeAction_ = viewMenu->addAction(QStringLiteral("图像最大化"));
+    imageMaximizeAction_->setCheckable(true);
+    imageMaximizeAction_->setShortcut(QKeySequence(Qt::Key_F11));
+    connect(imageMaximizeAction_, &QAction::triggered, this, &MainWindow::toggleImageMaximized);
+
     menuBar()->addMenu(QStringLiteral("校准"));
     menuBar()->addMenu(QStringLiteral("工具"));
-    menuBar()->addMenu(QStringLiteral("开发者"));
     menuBar()->addMenu(QStringLiteral("帮助"));
 }
 
@@ -416,6 +660,18 @@ void MainWindow::createStatusBar() {
     progressLabel_ = new QLabel(QStringLiteral("缩放: --"));
     fpsLabel_ = new QLabel(QStringLiteral("fps: 0.00"));
 
+    const auto configureStatusLabel = [](QLabel* label) {
+        label->setObjectName(QStringLiteral("statusLabel"));
+        label->setContentsMargins(6, 2, 6, 2);
+    };
+    configureStatusLabel(modelLabel_);
+    configureStatusLabel(serialLabel_);
+    configureStatusLabel(connectionLabel_);
+    configureStatusLabel(modeLabel_);
+    configureStatusLabel(imageLabel_);
+    configureStatusLabel(progressLabel_);
+    configureStatusLabel(fpsLabel_);
+
     statusBar()->addWidget(modelLabel_);
     statusBar()->addWidget(serialLabel_);
     statusBar()->addWidget(connectionLabel_);
@@ -427,19 +683,190 @@ void MainWindow::createStatusBar() {
 
 void MainWindow::appendLog(const QString& text) {
     const QString now = QDateTime::currentDateTime().toString("HH:mm:ss.zzz");
-    logView_->append(QStringLiteral("[%1] %2").arg(now, text));
+    const QString line = QStringLiteral("[%1] %2").arg(now, text);
+    if (logView_ != nullptr) {
+        logView_->append(line);
+    } else {
+        qInfo().noquote() << line;
+    }
 }
 
-void MainWindow::refreshImage() {
+void MainWindow::scheduleImageRefresh(bool resetViewState) {
+    resetViewStateOnRefresh_ = resetViewStateOnRefresh_ || resetViewState;
+    imageRefreshTimer_.start();
+}
+
+void MainWindow::refreshImage(bool resetViewState) {
     if (!currentRaw_.isValid()) {
         return;
+    }
+
+    if (autoWindowCheck_->isChecked()) {
+        const QSignalBlocker blockCenterSlider(centerSlider_);
+        const QSignalBlocker blockWidthSlider(widthSlider_);
+        const QSignalBlocker blockCenterSpin(centerSpin_);
+        const QSignalBlocker blockWidthSpin(widthSpin_);
+
+        centerSlider_->setValue(currentRaw_.autoWindowCenter());
+        centerSpin_->setValue(currentRaw_.autoWindowCenter());
+        widthSlider_->setValue(currentRaw_.autoWindowWidth());
+        widthSpin_->setValue(currentRaw_.autoWindowWidth());
     }
 
     const QImage display = currentRaw_.toDisplayImage(
         autoWindowCheck_->isChecked(),
         centerSpin_->value(),
         widthSpin_->value());
-    imageView_->setImage(display);
+    imageView_->setImage(display, resetViewState);
+}
+
+void MainWindow::updatePixelInfo(const QPoint& imagePoint) {
+    if (pixelInfoLabel_ == nullptr) {
+        return;
+    }
+
+    quint16 value = 0;
+    if (!currentRaw_.pixelValue(imagePoint.x(), imagePoint.y(), &value)) {
+        pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
+        return;
+    }
+
+    pixelInfoLabel_->setText(QStringLiteral("像素值(%1,%2):%3")
+                                 .arg(imagePoint.x())
+                                 .arg(imagePoint.y())
+                                 .arg(value));
+}
+
+void MainWindow::updateRoiInfo(const QRect& imageRect) {
+    if (roiInfoLabel_ == nullptr) {
+        return;
+    }
+
+    TiRawImage::RoiStats stats;
+    if (!currentRaw_.roiStats(imageRect, &stats)) {
+        roiInfoLabel_->setText(QStringLiteral("ROI 信息: --"));
+        return;
+    }
+
+    const bool fullImage = stats.rect == QRect(0, 0, currentRaw_.width(), currentRaw_.height());
+    roiInfoLabel_->setText(QStringLiteral(
+                               "区域 %1\n"
+                               "范围 (%2,%3)-(%4,%5)\n"
+                               "像素 %6\n"
+                               "均值 %7\n"
+                               "最小/最大 %8 / %9\n"
+                               "标准差 %10\n"
+                               "行噪声 %11")
+                               .arg(fullImage ? QStringLiteral("全图") : QStringLiteral("ROI"))
+                               .arg(stats.rect.left())
+                               .arg(stats.rect.top())
+                               .arg(stats.rect.right())
+                               .arg(stats.rect.bottom())
+                               .arg(stats.pixelCount)
+                               .arg(QString::number(stats.mean, 'f', 4))
+                               .arg(stats.min)
+                               .arg(stats.max)
+                               .arg(QString::number(stats.stddev, 'f', 4))
+                               .arg(QString::number(stats.rowNoise, 'f', 4)));
+}
+
+void MainWindow::updateFullImageInfo() {
+    if (!currentRaw_.isValid()) {
+        if (roiInfoLabel_ != nullptr) {
+            roiInfoLabel_->setText(QStringLiteral("ROI 信息: --"));
+        }
+        return;
+    }
+
+    updateRoiInfo(QRect(0, 0, currentRaw_.width(), currentRaw_.height()));
+}
+
+void MainWindow::handleAnalysisRoi(const QRect& imageRect) {
+    updateRoiInfo(imageRect);
+
+    TiRawImage::RoiStats stats;
+    if (!currentRaw_.roiStats(imageRect, &stats)) {
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("分析测试"));
+    dialog.resize(1280, 720);
+
+    auto* root = new QHBoxLayout(&dialog);
+    root->setContentsMargins(0, 0, 12, 12);
+    root->setSpacing(12);
+
+    auto* previewLabel = new QLabel(&dialog);
+    previewLabel->setAlignment(Qt::AlignCenter);
+    previewLabel->setMinimumSize(700, 640);
+    previewLabel->setStyleSheet(QStringLiteral("background:#08090a;"));
+
+    const QImage display = currentRaw_.toDisplayImage(
+        autoWindowCheck_->isChecked(),
+        centerSpin_->value(),
+        widthSpin_->value());
+    previewLabel->setPixmap(drawAnalysisPreview(display, stats.rect, previewLabel->minimumSize()));
+
+    auto* rightPanel = new QWidget(&dialog);
+    auto* rightLayout = new QVBoxLayout(rightPanel);
+    rightLayout->setContentsMargins(0, 24, 0, 0);
+    rightLayout->setSpacing(18);
+
+    const QVector<double> esf = columnProfile(currentRaw_, stats.rect);
+    const QVector<double> lsf = derivativeProfile(esf);
+    const QVector<double> mtf = mtfProfile(lsf);
+
+    constexpr int chartWidth = 430;
+    constexpr int chartHeight = 185;
+    auto* esfLabel = new QLabel(&dialog);
+    auto* lsfLabel = new QLabel(&dialog);
+    auto* mtfLabel = new QLabel(&dialog);
+    esfLabel->setPixmap(drawLineChart(QStringLiteral("Edge Spread Function"), QStringLiteral("ESF (ADC/mm)"), QStringLiteral("Distance (mm)"), esf, {chartWidth, chartHeight}));
+    lsfLabel->setPixmap(drawLineChart(QStringLiteral("Line Spread Function"), QStringLiteral("LSF (ADC/mm)"), QStringLiteral("Distance (mm)"), lsf, {chartWidth, chartHeight}));
+    mtfLabel->setPixmap(drawLineChart(QStringLiteral("Modulation Transfer Function (Pixel Size:100um)"), QStringLiteral("MTF"), QStringLiteral("Spatial Frequency (lp/mm)"), mtf, {chartWidth, chartHeight}));
+
+    auto* closeButtons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    connect(closeButtons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    rightLayout->addWidget(esfLabel);
+    rightLayout->addWidget(lsfLabel);
+    rightLayout->addWidget(mtfLabel);
+    rightLayout->addStretch(1);
+    rightLayout->addWidget(closeButtons);
+
+    root->addWidget(previewLabel, 1);
+    root->addWidget(rightPanel);
+
+    dialog.exec();
+}
+
+void MainWindow::applyWindowLevelFromRoi(const QRect& imageRect) {
+    updateRoiInfo(imageRect);
+
+    TiRawImage::RoiStats stats;
+    if (!currentRaw_.roiStats(imageRect, &stats)) {
+        return;
+    }
+
+    const int center = std::max(0, std::min(65535, (static_cast<int>(stats.min) + static_cast<int>(stats.max)) / 2));
+    const int width = std::max(1, std::min(65535, static_cast<int>(stats.max) - static_cast<int>(stats.min)));
+
+    {
+        const QSignalBlocker blockAuto(autoWindowCheck_);
+        const QSignalBlocker blockCenterSlider(centerSlider_);
+        const QSignalBlocker blockWidthSlider(widthSlider_);
+        const QSignalBlocker blockCenterSpin(centerSpin_);
+        const QSignalBlocker blockWidthSpin(widthSpin_);
+
+        autoWindowCheck_->setChecked(false);
+        centerSlider_->setValue(center);
+        centerSpin_->setValue(center);
+        widthSlider_->setValue(width);
+        widthSpin_->setValue(width);
+    }
+
+    refreshImage(false);
 }
 
 void MainWindow::updateStatusFromResponse(const PaProtocol::Response& response) {

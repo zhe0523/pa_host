@@ -3,12 +3,14 @@
 #include <QFile>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <utility>
 
 namespace {
 constexpr int kHeaderSize = 16;
 constexpr char kMagic[] = "TiRayRaw";
+constexpr double kAutoWindowTailPercent = 0.006;
 }
 
 bool TiRawImage::load(const QString& path, QString* errorMessage) {
@@ -107,6 +109,100 @@ quint16 TiRawImage::maxValue() const {
     return maxValue_;
 }
 
+int TiRawImage::autoWindowCenter() const {
+    return autoWindowCenter_;
+}
+
+int TiRawImage::autoWindowWidth() const {
+    return autoWindowWidth_;
+}
+
+int TiRawImage::autoWindowLow() const {
+    return autoWindowLow_;
+}
+
+int TiRawImage::autoWindowHigh() const {
+    return autoWindowHigh_;
+}
+
+bool TiRawImage::pixelValue(int x, int y, quint16* value) const {
+    if (!isValid() || x < 0 || y < 0 || x >= width_ || y >= height_) {
+        return false;
+    }
+    if (value != nullptr) {
+        *value = pixels_.at(y * width_ + x);
+    }
+    return true;
+}
+
+bool TiRawImage::roiStats(const QRect& rect, RoiStats* stats) const {
+    if (!isValid() || stats == nullptr) {
+        return false;
+    }
+
+    const QRect imageRect(0, 0, width_, height_);
+    const QRect roi = rect.normalized().intersected(imageRect);
+    if (roi.isEmpty()) {
+        return false;
+    }
+
+    RoiStats result;
+    result.rect = roi;
+    result.pixelCount = roi.width() * roi.height();
+    result.min = std::numeric_limits<quint16>::max();
+    result.max = std::numeric_limits<quint16>::min();
+
+    double sum = 0.0;
+    double sumSquares = 0.0;
+    QVector<double> rowMeans;
+    rowMeans.reserve(roi.height());
+
+    for (int y = roi.top(); y <= roi.bottom(); ++y) {
+        double rowSum = 0.0;
+        const int row = y * width_;
+        for (int x = roi.left(); x <= roi.right(); ++x) {
+            const quint16 value = pixels_.at(row + x);
+            result.min = std::min(result.min, value);
+            result.max = std::max(result.max, value);
+            sum += value;
+            sumSquares += static_cast<double>(value) * value;
+            rowSum += value;
+        }
+        rowMeans.push_back(rowSum / roi.width());
+    }
+
+    result.mean = sum / result.pixelCount;
+    const double variance = std::max(0.0, sumSquares / result.pixelCount - result.mean * result.mean);
+    result.stddev = std::sqrt(variance);
+    result.noiseLevel = result.stddev;
+
+    if (rowMeans.size() > 1) {
+        double diffSum = 0.0;
+        for (int i = 1; i < rowMeans.size(); ++i) {
+            diffSum += std::abs(rowMeans.at(i) - rowMeans.at(i - 1));
+        }
+        result.rowNoise = diffSum / (rowMeans.size() - 1);
+
+        double rowMeanSum = 0.0;
+        for (const double rowMean : rowMeans) {
+            rowMeanSum += rowMean;
+        }
+        const double rowMeanAverage = rowMeanSum / rowMeans.size();
+        double rowVarianceSum = 0.0;
+        for (const double rowMean : rowMeans) {
+            const double delta = rowMean - rowMeanAverage;
+            rowVarianceSum += delta * delta;
+        }
+        result.rowNoiseStddev = std::sqrt(rowVarianceSum / rowMeans.size());
+        if (result.rowNoiseStddev > 0.0) {
+            result.rowNoiseRatio = result.rowNoise / result.rowNoiseStddev;
+        }
+    }
+
+    *stats = result;
+    return true;
+}
+
 QImage TiRawImage::toDisplayImage(bool autoWindow, int windowCenter, int windowWidth) const {
     if (!isValid()) {
         return {};
@@ -116,8 +212,8 @@ QImage TiRawImage::toDisplayImage(bool autoWindow, int windowCenter, int windowW
     int high = 65535;
 
     if (autoWindow) {
-        low = minValue_;
-        high = maxValue_;
+        low = autoWindowLow_;
+        high = autoWindowHigh_;
     } else {
         const int width = std::max(1, windowWidth);
         low = windowCenter - width / 2;
@@ -156,4 +252,48 @@ void TiRawImage::updateRange() {
     auto range = std::minmax_element(pixels_.begin(), pixels_.end());
     minValue_ = *range.first;
     maxValue_ = *range.second;
+    updateAutoWindowLevel();
+}
+
+void TiRawImage::updateAutoWindowLevel() {
+    if (pixels_.isEmpty()) {
+        autoWindowLow_ = 0;
+        autoWindowHigh_ = 65535;
+        autoWindowCenter_ = 32767;
+        autoWindowWidth_ = 65535;
+        return;
+    }
+
+    QVector<int> histogram(65536);
+    for (const quint16 value : pixels_) {
+        ++histogram[value];
+    }
+
+    const int total = pixels_.size();
+    const int lowRank = static_cast<int>(std::round(kAutoWindowTailPercent * (total - 1)));
+    const int highRank = static_cast<int>(std::round((1.0 - kAutoWindowTailPercent) * (total - 1)));
+
+    auto valueAtRank = [&histogram](int rank) {
+        int cumulative = 0;
+        for (int value = 0; value < histogram.size(); ++value) {
+            cumulative += histogram.at(value);
+            if (cumulative > rank) {
+                return value;
+            }
+        }
+        return histogram.size() - 1;
+    };
+
+    autoWindowLow_ = valueAtRank(lowRank);
+    autoWindowHigh_ = valueAtRank(highRank);
+    if (autoWindowHigh_ <= autoWindowLow_) {
+        if (autoWindowLow_ >= 65535) {
+            autoWindowLow_ = 65534;
+            autoWindowHigh_ = 65535;
+        } else {
+            autoWindowHigh_ = autoWindowLow_ + 1;
+        }
+    }
+    autoWindowCenter_ = (autoWindowLow_ + autoWindowHigh_) / 2;
+    autoWindowWidth_ = autoWindowHigh_ - autoWindowLow_;
 }

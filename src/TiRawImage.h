@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QImage>
+#include <QRect>
 #include <QString>
 #include <QVector>
 #include <QtGlobal>
@@ -20,6 +21,19 @@
  */
 class TiRawImage {
 public:
+    struct RoiStats {
+        QRect rect;
+        int pixelCount = 0;
+        double mean = 0.0;
+        quint16 min = 0;
+        quint16 max = 0;
+        double stddev = 0.0;
+        double noiseLevel = 0.0;
+        double rowNoise = 0.0;
+        double rowNoiseStddev = 0.0;
+        double rowNoiseRatio = 0.0;
+    };
+
     bool load(const QString& path, QString* errorMessage);
     bool isValid() const;
 
@@ -30,12 +44,19 @@ public:
     int height() const;
     quint16 minValue() const;
     quint16 maxValue() const;
+    int autoWindowCenter() const;
+    int autoWindowWidth() const;
+    int autoWindowLow() const;
+    int autoWindowHigh() const;
+    bool pixelValue(int x, int y, quint16* value) const;
+    bool roiStats(const QRect& rect, RoiStats* stats) const;
 
     QImage toDisplayImage(bool autoWindow, int windowCenter, int windowWidth) const;
 
 private:
     static quint16 readLe16(const uchar* p);
     void updateRange();
+    void updateAutoWindowLevel();
 
     QString path_;
     quint16 version_ = 0;
@@ -44,6 +65,9 @@ private:
     int height_ = 0;
     quint16 minValue_ = 0;
     quint16 maxValue_ = 0;
+    int autoWindowLow_ = 0;
+    int autoWindowHigh_ = 65535;
+    int autoWindowCenter_ = 32767;
+    int autoWindowWidth_ = 65535;
     QVector<quint16> pixels_;
 };
-

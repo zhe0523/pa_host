@@ -1,6 +1,7 @@
 #include "PaProtocol.h"
 
 #include <QStringList>
+#include <QtGlobal>
 
 QString PaProtocol::commandText(Command command) {
     switch (command) {
@@ -47,7 +48,7 @@ QString PaProtocol::commandName(Command command) {
     case Command::StartCorrection:
         return QStringLiteral("启动校正");
     case Command::SendImage:
-        return QStringLiteral("通知传图");
+        return QStringLiteral("手动上图");
     case Command::Quit:
         return QStringLiteral("退出 ARM");
     }
@@ -73,7 +74,11 @@ PaProtocol::Response PaProtocol::parseResponse(const QString& line) {
     Response response;
     response.rawLine = line.trimmed();
 
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
     const QStringList fields = response.rawLine.split(' ', Qt::SkipEmptyParts);
+#else
+    const QStringList fields = response.rawLine.split(' ', QString::SkipEmptyParts);
+#endif
     if (fields.isEmpty()) {
         return response;
     }
@@ -103,4 +108,3 @@ PaProtocol::Response PaProtocol::parseResponse(const QString& line) {
 
     return response;
 }
-

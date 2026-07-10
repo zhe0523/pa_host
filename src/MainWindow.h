@@ -1,12 +1,14 @@
 #pragma once
 
 #include <QLabel>
-#include <QLineEdit>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QPlainTextEdit>
+#include <QPoint>
+#include <QRect>
 #include <QSpinBox>
 #include <QTextEdit>
+#include <QTimer>
 
 #include "ImageView.h"
 #include "PaProtocol.h"
@@ -16,6 +18,7 @@
 class QCheckBox;
 class QComboBox;
 class QSlider;
+class QAction;
 
 /*
  * 主窗口。
@@ -36,35 +39,43 @@ private slots:
     void connectSerial();
     void disconnectSerial();
     void sendCommand(PaProtocol::Command command);
-    void sendCustomCommand();
     void handleLineReceived(const QString& line);
     void handleSerialError(const QString& message);
     void updateWindowLevel();
+    void toggleImageMaximized();
 
 private:
     QWidget* createTopBar();
     QWidget* createImageListPanel();
     QWidget* createRightPanel();
-    QWidget* createSerialPanel();
-    QWidget* createCommandPanel();
     QWidget* createImageOpsPanel();
     QWidget* createWindowLevelPanel();
+    QWidget* createImageInfoPanel();
     void createMenus();
     void createStatusBar();
     void appendLog(const QString& text);
-    void refreshImage();
+    void scheduleImageRefresh(bool resetViewState = false);
+    void refreshImage(bool resetViewState = false);
+    void updatePixelInfo(const QPoint& imagePoint);
+    void updateRoiInfo(const QRect& imageRect);
+    void updateFullImageInfo();
+    void handleAnalysisRoi(const QRect& imageRect);
+    void applyWindowLevelFromRoi(const QRect& imageRect);
     void updateStatusFromResponse(const PaProtocol::Response& response);
 
     SerialClient serial_;
     TiRawImage currentRaw_;
 
+    QWidget* topBar_ = nullptr;
+    QWidget* imageListPanel_ = nullptr;
+    QWidget* rightPanel_ = nullptr;
     QListWidget* imageList_ = nullptr;
     ImageView* imageView_ = nullptr;
     QTextEdit* logView_ = nullptr;
+    QAction* imageMaximizeAction_ = nullptr;
 
     QComboBox* portCombo_ = nullptr;
     QSpinBox* baudSpin_ = nullptr;
-    QLineEdit* customCommandEdit_ = nullptr;
 
     QCheckBox* autoWindowCheck_ = nullptr;
     QSlider* centerSlider_ = nullptr;
@@ -79,5 +90,10 @@ private:
     QLabel* imageLabel_ = nullptr;
     QLabel* progressLabel_ = nullptr;
     QLabel* fpsLabel_ = nullptr;
-};
+    QLabel* pixelInfoLabel_ = nullptr;
+    QLabel* roiInfoLabel_ = nullptr;
 
+    QTimer imageRefreshTimer_;
+    bool resetViewStateOnRefresh_ = false;
+    bool imageMaximized_ = false;
+};

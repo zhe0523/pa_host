@@ -7,8 +7,8 @@
 ```text
 操作系统：Kylin-Server-V10-SP3-2403
 CPU：海光 7420D，x86_64 兼容
-工程目录：/home/zhe/sdk/app/pa_host
-ARM 端工程：/home/zhe/sdk/app/pa_controller
+工程目录：/home/zhe/app/pa_host
+ARM 端工程：/home/zhe/app/pa_controller
 ```
 
 ## 需要安装的开发包
@@ -84,10 +84,18 @@ sudo usermod -aG dialout zhe
 ## 编译运行
 
 ```sh
-cd /home/zhe/sdk/app/pa_host
+cd /home/zhe/app/pa_host
 cmake -S . -B build
 cmake --build build -j
 ./build/pa_host
+```
+
+Qt Creator 可以直接打开 `CMakeLists.txt`。需要注意：
+
+```text
+1. Qt Creator 会默认创建 shadow build 目录，例如 /home/zhe/app/build-pa_host-Desktop-Default
+2. 这类目录和 CMakeLists.txt.user 都是本机构建/IDE 产物，不需要提交
+3. 命令行构建目录仍然建议使用 /home/zhe/app/pa_host/build
 ```
 
 ## 当前测试方式
@@ -103,7 +111,7 @@ cmake --build build -j
 可使用旧 Windows 样例：
 
 ```text
-/home/zhe/sdk/app/windows/tidetector/CollectImage/20260707-1035/*.tiraw
+/home/zhe/app/windows/tidetector/CollectImage/20260707-1035/*.tiraw
 ```
 
 预期：
@@ -112,14 +120,21 @@ cmake --build build -j
 图像能显示
 状态栏显示宽高
 右侧窗宽窗位能改变显示亮度
+自动窗宽窗位会同步更新窗位/窗宽输入框
+滚轮和 Ctrl+滚轮都能缩放
+左键拖动平移图像
+Ctrl+左键拖框弹出“分析测试”窗口
+Shift+左键拖框会根据 ROI 重算窗位和窗宽
+鼠标移动时右侧会显示像素坐标和值
+再次普通左键点击图像会清除当前 ROI 框
 缩放、旋转、翻转、保存 PNG 能使用
 ```
 
 Qt 环境还没装好时，可以先用辅助脚本确认样例文件头：
 
 ```sh
-cd /home/zhe/sdk/app/pa_host
-python3 tools/check_tiraw.py /home/zhe/sdk/app/windows/tidetector/CollectImage/20260707-1035/20260707-104636-873-00000001.tiraw
+cd /home/zhe/app/pa_host
+python3 tools/check_tiraw.py /home/zhe/app/windows/tidetector/CollectImage/20260707-1035/20260707-104636-873-00000001.tiraw
 ```
 
 ### 2. 再测 RS422/串口
@@ -141,22 +156,27 @@ python3 tools/check_tiraw.py /home/zhe/sdk/app/windows/tidetector/CollectImage/2
 已经完成：
 
 ```text
-Qt Widgets 主窗口骨架
-RS422 串口连接、断开、发送命令
+Qt Widgets 主窗口与基础样式
+RS422 菜单化连接、断开、发送命令
 按行接收 ARM 响应
 解析 OK/ERR 和 key=value 状态字段
-.tiraw 文件读取和显示
+.tiraw 文件读取、显示与 ROI 统计
+旧上位机风格自动窗宽窗位
 窗宽窗位、缩放、旋转、翻转、保存
+像素值显示
+Ctrl+ROI 分析测试弹窗
+Shift+ROI 按区域重算窗位窗宽
 ```
 
 还没完成：
 
 ```text
-正式 UI 细节和图标
+ESF/LSF/MTF 与旧软件完全一致的分析公式
 正式校准向导流程
 真实光口图像接收
+PCIe 采集链路接入
 正式二进制协议或带校验协议
-多线程图像处理优化
+高帧率多线程采集/显示优化
 安装包制作
 ```
 
@@ -170,3 +190,40 @@ RS422 串口连接、断开、发送命令
 ```
 
 所以新上位机应该继续保持专用工程，不要把旧 `TiRayLib.dll` 的网络模型搬过来。
+
+## 当前图像格式判断
+
+`.tiraw` 目前按样例反推为：
+
+```text
+0x00: "TiRayRaw" 8 字节
+0x08: uint16 version
+0x0A: uint16 bytes_per_pixel
+0x0C: uint16 height
+0x0E: uint16 width
+0x10: uint16 little-endian 灰度像素
+```
+
+自动窗宽窗位当前已改为接近旧上位机行为的直方图分位算法。对测试图
+`20260707-104636-873-00000001.tiraw`，当前程序可算到：
+
+```text
+窗位 = 3937
+窗宽 = 1948
+```
+
+旧上位机记录是 `3939 / 1948`，当前误差可接受。
+
+## 后续接 PCIe 的建议边界
+
+后续光口图像通过 PCIe 接入时，不建议让 UI 直接读硬件，建议拆分为：
+
+```text
+PCIe/SDK/驱动
+  -> 采集线程
+  -> 帧缓冲队列
+  -> 原始 16-bit 帧对象
+  -> UI 显示
+```
+
+第一步应该先做命令行采集测试程序，确认能稳定收一帧并保存成当前程序可打开的 `.tiraw`，再接到 GUI。
