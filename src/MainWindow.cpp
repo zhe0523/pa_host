@@ -9,6 +9,7 @@
 #include <QDebug>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
@@ -21,10 +22,12 @@
 #include <QPushButton>
 #include <QScreen>
 #include <QSerialPortInfo>
+#include <QSettings>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSplitter>
+#include <QStandardPaths>
 #include <QStatusBar>
 #include <QWidgetAction>
 
@@ -54,12 +57,39 @@ QPushButton* makeCommandButton(const QString& text) {
 
 void populateSerialPorts(QComboBox* combo) {
     combo->clear();
+    combo->setEditable(true);
     for (const QSerialPortInfo& info : QSerialPortInfo::availablePorts()) {
+#ifdef Q_OS_WIN
+        combo->addItem(info.portName());
+#else
         combo->addItem(info.systemLocation());
+#endif
     }
     if (combo->count() == 0) {
+#ifdef Q_OS_WIN
+        combo->addItems({QStringLiteral("COM1"), QStringLiteral("COM2"), QStringLiteral("COM3"), QStringLiteral("COM4")});
+#else
         combo->addItems({QStringLiteral("/dev/ttyS0"), QStringLiteral("/dev/ttyS1"), QStringLiteral("/dev/ttyUSB0")});
+#endif
     }
+}
+
+QString defaultImageDirectory() {
+    QSettings settings;
+    const QString remembered = settings.value(QStringLiteral("paths/lastImageDirectory")).toString();
+    if (!remembered.isEmpty() && QDir(remembered).exists()) {
+        return remembered;
+    }
+
+#ifndef Q_OS_WIN
+    const QString sampleDirectory = QStringLiteral("/home/zhe/app/windows/tidetector/CollectImage");
+    if (QDir(sampleDirectory).exists()) {
+        return sampleDirectory;
+    }
+#endif
+
+    const QString picturesDirectory = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+    return picturesDirectory.isEmpty() ? QDir::homePath() : picturesDirectory;
 }
 
 QVector<double> columnProfile(const TiRawImage& image, const QRect& rect) {
@@ -276,10 +306,11 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 void MainWindow::openImage() {
+    const QString initialDirectory = defaultImageDirectory();
     const QString path = QFileDialog::getOpenFileName(
         this,
         QStringLiteral("打开 TiRaw 图像"),
-        QStringLiteral("/home/zhe/app/windows/tidetector/CollectImage"),
+        initialDirectory,
         QStringLiteral("TiRayRaw (*.tiraw);;All Files (*)"));
     if (path.isEmpty()) {
         return;
@@ -291,6 +322,8 @@ void MainWindow::openImage() {
         QMessageBox::warning(this, QStringLiteral("打开失败"), error);
         return;
     }
+
+    QSettings().setValue(QStringLiteral("paths/lastImageDirectory"), QFileInfo(path).absolutePath());
 
     currentRaw_ = image;
     imageList_->addItem(QFileInfo(path).fileName());
@@ -319,10 +352,16 @@ void MainWindow::saveDisplayImage() {
         return;
     }
 
+    QSettings settings;
+    QString saveDirectory = settings.value(QStringLiteral("paths/lastSaveDirectory")).toString();
+    if (saveDirectory.isEmpty() || !QDir(saveDirectory).exists()) {
+        saveDirectory = defaultImageDirectory();
+    }
+
     const QString path = QFileDialog::getSaveFileName(
         this,
         QStringLiteral("保存显示图像"),
-        QStringLiteral("pa_host_display.png"),
+        QDir(saveDirectory).filePath(QStringLiteral("pa_host_display.png")),
         QStringLiteral("PNG Image (*.png)"));
     if (path.isEmpty()) {
         return;
@@ -332,6 +371,7 @@ void MainWindow::saveDisplayImage() {
         QMessageBox::warning(this, QStringLiteral("保存失败"), QStringLiteral("图像保存失败"));
         return;
     }
+    settings.setValue(QStringLiteral("paths/lastSaveDirectory"), QFileInfo(path).absolutePath());
     appendLog(QStringLiteral("保存显示图像: %1").arg(path));
 }
 

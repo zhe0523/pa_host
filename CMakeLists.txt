@@ -33,11 +33,10 @@ target_link_libraries(pa_host PRIVATE
     Qt${QT_VERSION_MAJOR}::SerialPort
 )
 
-target_compile_options(pa_host PRIVATE
-    -Wall
-    -Wextra
-    -Wpedantic
-)
+if(MSVC)
+    target_compile_options(pa_host PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(pa_host PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 install(TARGETS pa_host RUNTIME DESTINATION bin)
-

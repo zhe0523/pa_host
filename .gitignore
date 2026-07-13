@@ -1,5 +1,6 @@
 build/
 cmake-build-*/
+.idea/
 CMakeFiles/
 CMakeCache.txt
 Makefile
@@ -16,4 +17,3 @@ Makefile
 *.tif
 *.tiff
 *.tiraw.cache
-

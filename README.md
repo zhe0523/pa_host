@@ -40,6 +40,33 @@ cmake --build build -j
 能看到版本号，可以先直接尝试 CMake 构建。Qt Creator 可以直接打开 `CMakeLists.txt`，但会默认使用自己的
 shadow build 目录，例如 `/home/zhe/app/build-pa_host-Desktop-Default`，这属于正常构建产物。
 
+### Windows 构建与调试
+
+Windows 已验证可使用 Qt 5.12.12，并可在 Qt Creator 或 CLion 中直接打开 `CMakeLists.txt`。建议每个 IDE
+使用独立构建目录，避免共享 `CMakeCache.txt`。
+
+```text
+Qt Creator：选择 Qt 5.12.12 对应的 Desktop Kit
+CLion：Toolchain、CMake Profile 和 Qt 编译器保持一致
+MinGW 版 Qt 必须配套 MinGW，MSVC 版 Qt 必须配套 MSVC
+```
+
+命令行示例：
+
+```bat
+cmake -S . -B build-win -G Ninja -DCMAKE_PREFIX_PATH=C:\Qt\5.12.12\mingw73_64
+cmake --build build-win
+```
+
+发布时不能只复制 `pa_host.exe`，需要在 Qt 命令行环境执行：
+
+```bat
+windeployqt build-win\pa_host.exe
+```
+
+程序会记住最近打开和保存图片的目录。Windows 首次运行默认打开系统“图片”目录；串口列表使用 `COMx`，
+Linux/Kylin 使用 `/dev/tty*`。
+
 ## 当前界面能力
 
 当前版本已经把旧 Windows 上位机里最常用的一段图像查看工作流补齐：
