@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QLabel>
+#include <QElapsedTimer>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QPlainTextEdit>
@@ -10,6 +11,10 @@
 #include <QTextEdit>
 #include <QTimer>
 
+#include <memory>
+
+#include "ImageSession.h"
+#include "ImageSource.h"
 #include "ImageView.h"
 #include "PaProtocol.h"
 #include "SerialClient.h"
@@ -32,9 +37,12 @@ class MainWindow : public QMainWindow {
 
 public:
     explicit MainWindow(QWidget* parent = nullptr);
+    explicit MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* parent = nullptr);
 
 private slots:
     void openImage();
+    void startImageReplay();
+    void stopImageReplay();
     void saveDisplayImage();
     void connectSerial();
     void disconnectSerial();
@@ -61,10 +69,12 @@ private:
     void updateFullImageInfo();
     void handleAnalysisRoi(const QRect& imageRect);
     void applyWindowLevelFromRoi(const QRect& imageRect);
+    void handleImageFrame(const ImageFrame& frame);
     void updateStatusFromResponse(const PaProtocol::Response& response);
 
     SerialClient serial_;
-    TiRawImage currentRaw_;
+    std::unique_ptr<ImageSession> imageSession_;
+    LocalReplaySource* replaySource_ = nullptr;
 
     QWidget* topBar_ = nullptr;
     QWidget* imageListPanel_ = nullptr;
@@ -94,6 +104,9 @@ private:
     QLabel* roiInfoLabel_ = nullptr;
 
     QTimer imageRefreshTimer_;
+    QElapsedTimer replayFpsTimer_;
+    QElapsedTimer imageInfoTimer_;
+    quint64 replayFpsFrameCount_ = 0;
     bool resetViewStateOnRefresh_ = false;
     bool imageMaximized_ = false;
 };

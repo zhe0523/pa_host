@@ -100,6 +100,32 @@ Qt Creator 可以直接打开 `CMakeLists.txt`。需要注意：
 
 ## 当前测试方式
 
+### 0. 先跑自动测试
+
+自动测试不依赖真实串口或外部 `.tiraw` 样例，会在临时目录生成测试图像：
+
+```sh
+cd /home/zhe/app/pa_host
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build -j
+cd build
+ctest --output-on-failure
+```
+
+预期结果：
+
+```text
+100% tests passed, 0 tests failed out of 1
+```
+
+当前覆盖协议解析、`.tiraw` 文件校验、像素读取、自动窗宽窗位、ROI 统计和显示映射。
+
+自动测试也覆盖 `ImageSession` 与本地连续回放源：回放帧序号、非循环播放结束以及坏文件跳过统计。
+
+核心代码已经拆成 `pa_core`、`pa_transport` 和 `pa_host` 三个 CMake 目标。图像算法通过
+`IImageAlgorithms` 接口调用，后续拿到旧软件算法源码时不需要修改主窗口。架构说明见
+`doc/architecture.md`。
+
 ### 1. 先测图像查看
 
 打开菜单：
@@ -129,6 +155,16 @@ Shift+左键拖框会根据 ROI 重算窗位和窗宽
 再次普通左键点击图像会清除当前 ROI 框
 缩放、旋转、翻转、保存 PNG 能使用
 ```
+
+### 1.1 测本地回放链路
+
+菜单选择：
+
+```text
+文件 -> 回放 TiRaw 序列
+```
+
+选择多张 `.tiraw` 后输入 30 fps。预期图像连续刷新、状态栏 FPS 有数值，且相同尺寸帧不会让缩放或平移回到初始状态。通过“文件 -> 停止图像回放”停止。该链路是未来 PCIe 图像源的 UI 验证入口，当前不依赖硬件。
 
 Qt 环境还没装好时，可以先用辅助脚本确认样例文件头：
 
@@ -227,3 +263,4 @@ PCIe/SDK/驱动
 ```
 
 第一步应该先做命令行采集测试程序，确认能稳定收一帧并保存成当前程序可打开的 `.tiraw`，再接到 GUI。
+当前 `TiRawImage::loadData` 已支持直接解析内存字节流，PCIe 组帧完成后不需要先写临时文件。

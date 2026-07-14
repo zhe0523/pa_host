@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QByteArray>
 #include <QImage>
 #include <QRect>
 #include <QString>
@@ -35,6 +36,7 @@ public:
     };
 
     bool load(const QString& path, QString* errorMessage);
+    bool loadData(const QByteArray& data, const QString& sourceName, QString* errorMessage);
     bool isValid() const;
 
     QString path() const;

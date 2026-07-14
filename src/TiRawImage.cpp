@@ -22,7 +22,10 @@ bool TiRawImage::load(const QString& path, QString* errorMessage) {
         return false;
     }
 
-    const QByteArray data = file.readAll();
+    return loadData(file.readAll(), path, errorMessage);
+}
+
+bool TiRawImage::loadData(const QByteArray& data, const QString& sourceName, QString* errorMessage) {
     if (data.size() < kHeaderSize) {
         if (errorMessage != nullptr) {
             *errorMessage = QStringLiteral("文件太小，不是有效 TiRayRaw 图像");
@@ -66,7 +69,7 @@ bool TiRawImage::load(const QString& path, QString* errorMessage) {
         pixels[i] = readLe16(src + i * 2);
     }
 
-    path_ = path;
+    path_ = sourceName;
     version_ = version;
     bytesPerPixel_ = bytesPerPixel;
     width_ = width;

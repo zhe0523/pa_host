@@ -17,12 +17,17 @@ RS422 与 ARM pa_controller 通讯
 
 ```text
 src/MainWindow.*     Qt 主窗口，负责菜单、图像交互、ROI/分析弹窗、窗宽窗位
+src/ImageAlgorithms.* 图像算法接口和当前内置实现，旧算法从这里替换
+src/ImageSource.*    图像源抽象和本地 .tiraw 连续回放实现
+src/ImageSession.*   当前图像帧、显示渲染和算法调用的应用层边界
 src/SerialClient.*   RS422 串口按行收发
 src/PaProtocol.*     当前 ARM ASCII 命令和响应解析
 src/TiRawImage.*     Windows 样例 .tiraw 16-bit 灰度图读取、自动窗宽窗位、ROI 统计
 src/ImageView.*      图像显示、缩放、平移、ROI 框选、保存
 doc/kylin-handover.md 给 Kylin 机器继续开发时看的交接文档
-doc/git-commit-note-20260710.md 本次阶段性交付的中文提交说明
+doc/architecture.md   模块边界、算法替换和 PCIe 图像链路设计
+doc/git-commit-note-20260710.md 图像交互阶段的中文提交说明
+doc/git-commit-note-20260714.md 架构解耦与图像回放阶段的中文提交说明
 ```
 
 ## 构建
@@ -67,6 +72,52 @@ windeployqt build-win\pa_host.exe
 程序会记住最近打开和保存图片的目录。Windows 首次运行默认打开系统“图片”目录；串口列表使用 `COMx`，
 Linux/Kylin 使用 `/dev/tty*`。
 
+## 自动测试
+
+测试默认由 CMake 的 `BUILD_TESTING` 选项启用，不依赖 Qt Test 或真实硬件。构建和运行：
+
+```sh
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build -j
+cd build
+ctest --output-on-failure
+```
+
+Windows 可在 CLion 的 CTest 面板运行 `pa_host_tests`，也可以在构建目录执行：
+
+```bat
+ctest --output-on-failure
+```
+
+当前测试覆盖：
+
+```text
+PA/ARM 命令字符串和 OK/ERR 响应解析
+.tiraw 正常文件头、尺寸、像素读取
+.tiraw 错误魔数、错误位深、长度不匹配和短文件
+0.6% ~ 99.4% 自动窗宽窗位
+ROI 均值、最小/最大、标准差和行噪声
+手动窗宽窗位的 8-bit 显示映射
+图像算法接口的自动/ROI 窗宽窗位契约
+内存字节流解析为 TiRawImage
+ImageSession 文件加载、当前帧、ROI 和显示渲染
+LocalReplaySource 帧序号、停止状态、坏文件跳过和统计
+ESF / LSF / MTF 基础分析与 CSV 导出
+```
+
+## 代码结构
+
+工程按构建目标拆分：
+
+```text
+pa_core       图像数据、协议解析、算法接口和默认算法
+pa_transport  RS422 串口收发
+pa_host       Qt 界面和模块组装
+pa_host_tests 无界面核心测试
+```
+
+`MainWindow` 不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
+
 ## 当前界面能力
 
 当前版本已经把旧 Windows 上位机里最常用的一段图像查看工作流补齐：
@@ -90,6 +141,16 @@ Shift+左键拖框：按 ROI 重新计算窗位/窗宽
 再次普通左键点击：清除当前 ROI 框
 鼠标移动：右侧显示当前像素坐标和值
 ```
+
+图像输入：
+
+```text
+文件 -> 打开 TiRaw 图像：加载单张本地图像
+文件 -> 回放 TiRaw 序列：选择多张图像、设置 1~120 fps 后循环回放
+文件 -> 停止图像回放：停止本地回放
+```
+
+回放使用和未来 PCIe 相同的 `IImageSource -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际回放 FPS。PCIe 尚未接入。
 
 ## 与 ARM 的当前协议
 
@@ -174,6 +235,12 @@ RS422 菜单化控制入口
 ROI 统计
 Ctrl+ROI 分析测试弹窗
 Shift+ROI 按区域重算窗位窗宽
+图像算法接口与默认实现解耦
+本地 TiRaw 序列连续回放
+连续帧实际 FPS、错误和完成统计
+相同尺寸连续帧保持当前图像视图状态
+ESF / LSF / MTF 曲线 CSV 导出
+核心模块无硬件自动测试
 ```
 
 还没完成：

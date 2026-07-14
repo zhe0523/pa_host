@@ -15,6 +15,7 @@
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QGuiApplication>
+#include <QInputDialog>
 #include <QKeySequence>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -33,6 +34,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace {
 QSize initialWindowSize() {
@@ -90,64 +92,6 @@ QString defaultImageDirectory() {
 
     const QString picturesDirectory = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
     return picturesDirectory.isEmpty() ? QDir::homePath() : picturesDirectory;
-}
-
-QVector<double> columnProfile(const TiRawImage& image, const QRect& rect) {
-    QVector<double> profile;
-    profile.reserve(rect.width());
-    for (int x = rect.left(); x <= rect.right(); ++x) {
-        double sum = 0.0;
-        for (int y = rect.top(); y <= rect.bottom(); ++y) {
-            quint16 value = 0;
-            image.pixelValue(x, y, &value);
-            sum += value;
-        }
-        profile.push_back(sum / rect.height());
-    }
-    return profile;
-}
-
-QVector<double> derivativeProfile(const QVector<double>& values) {
-    QVector<double> result;
-    if (values.size() < 2) {
-        return result;
-    }
-    result.reserve(values.size() - 1);
-    for (int i = 1; i < values.size(); ++i) {
-        result.push_back(values.at(i) - values.at(i - 1));
-    }
-    return result;
-}
-
-QVector<double> mtfProfile(const QVector<double>& lsf) {
-    QVector<double> result;
-    const int n = lsf.size();
-    if (n < 2) {
-        return result;
-    }
-
-    const int bins = std::min(160, n / 2);
-    result.reserve(bins);
-    double dc = 0.0;
-    for (const double value : lsf) {
-        dc += std::abs(value);
-    }
-    if (dc <= 0.0) {
-        dc = 1.0;
-    }
-
-    constexpr double pi = 3.14159265358979323846;
-    for (int k = 0; k < bins; ++k) {
-        double real = 0.0;
-        double imag = 0.0;
-        for (int i = 0; i < n; ++i) {
-            const double angle = -2.0 * pi * k * i / n;
-            real += lsf.at(i) * std::cos(angle);
-            imag += lsf.at(i) * std::sin(angle);
-        }
-        result.push_back(std::sqrt(real * real + imag * imag) * 100.0 / dc);
-    }
-    return result;
 }
 
 QPixmap drawAnalysisPreview(const QImage& image, const QRect& roi, const QSize& size) {
@@ -250,7 +194,13 @@ QPixmap drawLineChart(
 }
 
 MainWindow::MainWindow(QWidget* parent)
+    : MainWindow(std::make_shared<BuiltinImageAlgorithms>(), parent) {
+}
+
+MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* parent)
     : QMainWindow(parent) {
+    imageSession_ = std::make_unique<ImageSession>(std::move(algorithms), this);
+    replaySource_ = new LocalReplaySource(this);
     setWindowTitle(QStringLiteral("PA Host"));
     setMinimumSize(1180, 820);
     resize(initialWindowSize());
@@ -297,6 +247,18 @@ MainWindow::MainWindow(QWidget* parent)
     connect(imageView_, &ImageView::analysisRoiSelected, this, &MainWindow::handleAnalysisRoi);
     connect(imageView_, &ImageView::windowLevelRoiSelected, this, &MainWindow::applyWindowLevelFromRoi);
     connect(imageView_, &ImageView::roiCleared, this, &MainWindow::updateFullImageInfo);
+    connect(replaySource_, &LocalReplaySource::frameReady, this, &MainWindow::handleImageFrame);
+    connect(replaySource_, &LocalReplaySource::sourceError, this, [this](const QString& message) {
+        appendLog(message);
+    });
+    connect(replaySource_, &LocalReplaySource::runningChanged, this, [this](bool running) {
+        if (!running) {
+            const ImageSourceStats stats = replaySource_->stats();
+            appendLog(QStringLiteral("图像回放停止: 已显示 %1 帧，失败 %2 帧")
+                          .arg(stats.deliveredFrames)
+                          .arg(stats.failedFrames));
+        }
+    });
     imageRefreshTimer_.setSingleShot(true);
     imageRefreshTimer_.setInterval(35);
     connect(&imageRefreshTimer_, &QTimer::timeout, this, [this]() {
@@ -306,6 +268,7 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 void MainWindow::openImage() {
+    stopImageReplay();
     const QString initialDirectory = defaultImageDirectory();
     const QString path = QFileDialog::getOpenFileName(
         this,
@@ -317,33 +280,76 @@ void MainWindow::openImage() {
     }
 
     QString error;
-    TiRawImage image;
-    if (!image.load(path, &error)) {
+    if (!imageSession_->loadFile(path, &error)) {
         QMessageBox::warning(this, QStringLiteral("打开失败"), error);
         return;
     }
 
     QSettings().setValue(QStringLiteral("paths/lastImageDirectory"), QFileInfo(path).absolutePath());
 
-    currentRaw_ = image;
     imageList_->addItem(QFileInfo(path).fileName());
     imageList_->setCurrentRow(imageList_->count() - 1);
-    imageLabel_->setText(QStringLiteral("%1 x %2").arg(currentRaw_.width()).arg(currentRaw_.height()));
+    const TiRawImage& image = imageSession_->image();
+    imageLabel_->setText(QStringLiteral("%1 x %2").arg(image.width()).arg(image.height()));
     if (pixelInfoLabel_ != nullptr) {
         pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
     }
     if (roiInfoLabel_ != nullptr) {
         updateFullImageInfo();
     }
+    const WindowLevelResult autoWindow = imageSession_->autoWindowLevel();
     appendLog(QStringLiteral("打开图像: %1, %2x%3, min=%4 max=%5, auto center=%6 width=%7")
                   .arg(path)
-                  .arg(currentRaw_.width())
-                  .arg(currentRaw_.height())
-                  .arg(currentRaw_.minValue())
-                  .arg(currentRaw_.maxValue())
-                  .arg(currentRaw_.autoWindowCenter())
-                  .arg(currentRaw_.autoWindowWidth()));
+                  .arg(image.width())
+                  .arg(image.height())
+                  .arg(image.minValue())
+                  .arg(image.maxValue())
+                  .arg(autoWindow.center)
+                  .arg(autoWindow.width));
     refreshImage(true);
+}
+
+void MainWindow::startImageReplay() {
+    const QStringList paths = QFileDialog::getOpenFileNames(
+        this,
+        QStringLiteral("选择回放 TiRaw 序列"),
+        defaultImageDirectory(),
+        QStringLiteral("TiRayRaw (*.tiraw);;All Files (*)"));
+    if (paths.isEmpty()) {
+        return;
+    }
+
+    bool accepted = false;
+    const int fps = QInputDialog::getInt(
+        this, QStringLiteral("回放帧率"), QStringLiteral("帧率 (fps)"), 30, 1, 120, 1, &accepted);
+    if (!accepted) {
+        return;
+    }
+
+    QSettings().setValue(QStringLiteral("paths/lastImageDirectory"), QFileInfo(paths.first()).absolutePath());
+    replaySource_->setPlaylist(paths);
+    replaySource_->setIntervalMs(std::max(1, 1000 / fps));
+    replaySource_->setLoopEnabled(true);
+    imageList_->clear();
+    for (const QString& path : paths) {
+        imageList_->addItem(QFileInfo(path).fileName());
+    }
+
+    replayFpsTimer_.start();
+    replayFpsFrameCount_ = 0;
+    fpsLabel_->setText(QStringLiteral("fps: 0.00"));
+    QString error;
+    if (!replaySource_->start(&error)) {
+        QMessageBox::warning(this, QStringLiteral("回放失败"), error);
+        return;
+    }
+    appendLog(QStringLiteral("开始图像回放: %1 个文件，目标 %2 fps").arg(paths.size()).arg(fps));
+}
+
+void MainWindow::stopImageReplay() {
+    if (replaySource_ != nullptr && replaySource_->isRunning()) {
+        replaySource_->stop();
+    }
 }
 
 void MainWindow::saveDisplayImage() {
@@ -624,11 +630,15 @@ QWidget* MainWindow::createImageInfoPanel() {
 void MainWindow::createMenus() {
     auto* fileMenu = menuBar()->addMenu(QStringLiteral("文件"));
     auto* openAction = fileMenu->addAction(QStringLiteral("打开 TiRaw 图像"));
+    auto* replayAction = fileMenu->addAction(QStringLiteral("回放 TiRaw 序列"));
+    auto* stopReplayAction = fileMenu->addAction(QStringLiteral("停止图像回放"));
     auto* saveAction = fileMenu->addAction(QStringLiteral("保存显示图像"));
     fileMenu->addSeparator();
     auto* quitAction = fileMenu->addAction(QStringLiteral("退出"));
 
     connect(openAction, &QAction::triggered, this, &MainWindow::openImage);
+    connect(replayAction, &QAction::triggered, this, &MainWindow::startImageReplay);
+    connect(stopReplayAction, &QAction::triggered, this, &MainWindow::stopImageReplay);
     connect(saveAction, &QAction::triggered, this, &MainWindow::saveDisplayImage);
     connect(quitAction, &QAction::triggered, this, &QWidget::close);
 
@@ -737,26 +747,27 @@ void MainWindow::scheduleImageRefresh(bool resetViewState) {
 }
 
 void MainWindow::refreshImage(bool resetViewState) {
-    if (!currentRaw_.isValid()) {
+    if (!imageSession_->hasImage()) {
         return;
     }
 
     if (autoWindowCheck_->isChecked()) {
+        const WindowLevelResult autoWindow = imageSession_->autoWindowLevel();
+        if (!autoWindow.valid) {
+            return;
+        }
         const QSignalBlocker blockCenterSlider(centerSlider_);
         const QSignalBlocker blockWidthSlider(widthSlider_);
         const QSignalBlocker blockCenterSpin(centerSpin_);
         const QSignalBlocker blockWidthSpin(widthSpin_);
 
-        centerSlider_->setValue(currentRaw_.autoWindowCenter());
-        centerSpin_->setValue(currentRaw_.autoWindowCenter());
-        widthSlider_->setValue(currentRaw_.autoWindowWidth());
-        widthSpin_->setValue(currentRaw_.autoWindowWidth());
+        centerSlider_->setValue(autoWindow.center);
+        centerSpin_->setValue(autoWindow.center);
+        widthSlider_->setValue(autoWindow.width);
+        widthSpin_->setValue(autoWindow.width);
     }
 
-    const QImage display = currentRaw_.toDisplayImage(
-        autoWindowCheck_->isChecked(),
-        centerSpin_->value(),
-        widthSpin_->value());
+    const QImage display = imageSession_->render(centerSpin_->value(), widthSpin_->value());
     imageView_->setImage(display, resetViewState);
 }
 
@@ -766,7 +777,7 @@ void MainWindow::updatePixelInfo(const QPoint& imagePoint) {
     }
 
     quint16 value = 0;
-    if (!currentRaw_.pixelValue(imagePoint.x(), imagePoint.y(), &value)) {
+    if (!imageSession_->image().pixelValue(imagePoint.x(), imagePoint.y(), &value)) {
         pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
         return;
     }
@@ -783,12 +794,13 @@ void MainWindow::updateRoiInfo(const QRect& imageRect) {
     }
 
     TiRawImage::RoiStats stats;
-    if (!currentRaw_.roiStats(imageRect, &stats)) {
+    if (!imageSession_->roiStats(imageRect, &stats)) {
         roiInfoLabel_->setText(QStringLiteral("ROI 信息: --"));
         return;
     }
 
-    const bool fullImage = stats.rect == QRect(0, 0, currentRaw_.width(), currentRaw_.height());
+    const TiRawImage& image = imageSession_->image();
+    const bool fullImage = stats.rect == QRect(0, 0, image.width(), image.height());
     roiInfoLabel_->setText(QStringLiteral(
                                "区域 %1\n"
                                "范围 (%2,%3)-(%4,%5)\n"
@@ -811,21 +823,22 @@ void MainWindow::updateRoiInfo(const QRect& imageRect) {
 }
 
 void MainWindow::updateFullImageInfo() {
-    if (!currentRaw_.isValid()) {
+    if (!imageSession_->hasImage()) {
         if (roiInfoLabel_ != nullptr) {
             roiInfoLabel_->setText(QStringLiteral("ROI 信息: --"));
         }
         return;
     }
 
-    updateRoiInfo(QRect(0, 0, currentRaw_.width(), currentRaw_.height()));
+    const TiRawImage& image = imageSession_->image();
+    updateRoiInfo(QRect(0, 0, image.width(), image.height()));
 }
 
 void MainWindow::handleAnalysisRoi(const QRect& imageRect) {
     updateRoiInfo(imageRect);
 
     TiRawImage::RoiStats stats;
-    if (!currentRaw_.roiStats(imageRect, &stats)) {
+    if (!imageSession_->roiStats(imageRect, &stats)) {
         return;
     }
 
@@ -842,10 +855,7 @@ void MainWindow::handleAnalysisRoi(const QRect& imageRect) {
     previewLabel->setMinimumSize(700, 640);
     previewLabel->setStyleSheet(QStringLiteral("background:#08090a;"));
 
-    const QImage display = currentRaw_.toDisplayImage(
-        autoWindowCheck_->isChecked(),
-        centerSpin_->value(),
-        widthSpin_->value());
+    const QImage display = imageSession_->render(centerSpin_->value(), widthSpin_->value());
     previewLabel->setPixmap(drawAnalysisPreview(display, stats.rect, previewLabel->minimumSize()));
 
     auto* rightPanel = new QWidget(&dialog);
@@ -853,21 +863,40 @@ void MainWindow::handleAnalysisRoi(const QRect& imageRect) {
     rightLayout->setContentsMargins(0, 24, 0, 0);
     rightLayout->setSpacing(18);
 
-    const QVector<double> esf = columnProfile(currentRaw_, stats.rect);
-    const QVector<double> lsf = derivativeProfile(esf);
-    const QVector<double> mtf = mtfProfile(lsf);
+    MtfAnalysisResult analysis;
+    if (!imageSession_->analyzeMtf(stats.rect, &analysis)) {
+        QMessageBox::warning(this, QStringLiteral("分析失败"), QStringLiteral("当前 ROI 无法生成 MTF 分析结果"));
+        return;
+    }
 
     constexpr int chartWidth = 430;
     constexpr int chartHeight = 185;
     auto* esfLabel = new QLabel(&dialog);
     auto* lsfLabel = new QLabel(&dialog);
     auto* mtfLabel = new QLabel(&dialog);
-    esfLabel->setPixmap(drawLineChart(QStringLiteral("Edge Spread Function"), QStringLiteral("ESF (ADC/mm)"), QStringLiteral("Distance (mm)"), esf, {chartWidth, chartHeight}));
-    lsfLabel->setPixmap(drawLineChart(QStringLiteral("Line Spread Function"), QStringLiteral("LSF (ADC/mm)"), QStringLiteral("Distance (mm)"), lsf, {chartWidth, chartHeight}));
-    mtfLabel->setPixmap(drawLineChart(QStringLiteral("Modulation Transfer Function (Pixel Size:100um)"), QStringLiteral("MTF"), QStringLiteral("Spatial Frequency (lp/mm)"), mtf, {chartWidth, chartHeight}));
+    esfLabel->setPixmap(drawLineChart(QStringLiteral("Edge Spread Function"), QStringLiteral("ESF (ADC/mm)"), QStringLiteral("Distance (mm)"), analysis.esf.y, {chartWidth, chartHeight}));
+    lsfLabel->setPixmap(drawLineChart(QStringLiteral("Line Spread Function"), QStringLiteral("LSF (ADC/mm)"), QStringLiteral("Distance (mm)"), analysis.lsf.y, {chartWidth, chartHeight}));
+    mtfLabel->setPixmap(drawLineChart(QStringLiteral("Modulation Transfer Function (Pixel Size:100um)"), QStringLiteral("MTF"), QStringLiteral("Spatial Frequency (lp/mm)"), analysis.mtf.y, {chartWidth, chartHeight}));
 
     auto* closeButtons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    auto* exportButton = closeButtons->addButton(QStringLiteral("导出 CSV"), QDialogButtonBox::ActionRole);
     connect(closeButtons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(exportButton, &QPushButton::clicked, &dialog, [this, analysis]() {
+        const QString directory = QFileDialog::getExistingDirectory(
+            this,
+            QStringLiteral("导出分析曲线"),
+            defaultImageDirectory());
+        if (directory.isEmpty()) {
+            return;
+        }
+
+        QString error;
+        if (!imageSession_->exportMtf(directory, analysis, &error)) {
+            QMessageBox::warning(this, QStringLiteral("导出失败"), error);
+            return;
+        }
+        appendLog(QStringLiteral("导出分析曲线: %1").arg(directory));
+    });
 
     rightLayout->addWidget(esfLabel);
     rightLayout->addWidget(lsfLabel);
@@ -885,12 +914,14 @@ void MainWindow::applyWindowLevelFromRoi(const QRect& imageRect) {
     updateRoiInfo(imageRect);
 
     TiRawImage::RoiStats stats;
-    if (!currentRaw_.roiStats(imageRect, &stats)) {
+    if (!imageSession_->roiStats(imageRect, &stats)) {
         return;
     }
 
-    const int center = std::max(0, std::min(65535, (static_cast<int>(stats.min) + static_cast<int>(stats.max)) / 2));
-    const int width = std::max(1, std::min(65535, static_cast<int>(stats.max) - static_cast<int>(stats.min)));
+    const WindowLevelResult windowLevel = imageSession_->roiWindowLevel(stats.rect);
+    if (!windowLevel.valid) {
+        return;
+    }
 
     {
         const QSignalBlocker blockAuto(autoWindowCheck_);
@@ -900,13 +931,41 @@ void MainWindow::applyWindowLevelFromRoi(const QRect& imageRect) {
         const QSignalBlocker blockWidthSpin(widthSpin_);
 
         autoWindowCheck_->setChecked(false);
-        centerSlider_->setValue(center);
-        centerSpin_->setValue(center);
-        widthSlider_->setValue(width);
-        widthSpin_->setValue(width);
+        centerSlider_->setValue(windowLevel.center);
+        centerSpin_->setValue(windowLevel.center);
+        widthSlider_->setValue(windowLevel.width);
+        widthSpin_->setValue(windowLevel.width);
     }
 
     refreshImage(false);
+}
+
+void MainWindow::handleImageFrame(const ImageFrame& frame) {
+    const bool resetViewState = !imageSession_->hasImage()
+        || imageSession_->image().width() != frame.image.width()
+        || imageSession_->image().height() != frame.image.height();
+    QString error;
+    if (!imageSession_->setFrame(frame, &error)) {
+        appendLog(QStringLiteral("接收图像帧失败: %1").arg(error));
+        return;
+    }
+
+    imageLabel_->setText(QStringLiteral("%1 x %2").arg(frame.image.width()).arg(frame.image.height()));
+    imageList_->setCurrentRow(static_cast<int>(frame.sequence % static_cast<quint64>(std::max(1, imageList_->count()))));
+    if (!imageInfoTimer_.isValid() || imageInfoTimer_.elapsed() >= 1000) {
+        updateFullImageInfo();
+        imageInfoTimer_.restart();
+    }
+    scheduleImageRefresh(resetViewState);
+
+    ++replayFpsFrameCount_;
+    const qint64 elapsedMs = replayFpsTimer_.elapsed();
+    if (elapsedMs >= 500) {
+        const double fps = replayFpsFrameCount_ * 1000.0 / elapsedMs;
+        fpsLabel_->setText(QStringLiteral("fps: %1").arg(fps, 0, 'f', 2));
+        replayFpsTimer_.restart();
+        replayFpsFrameCount_ = 0;
+    }
 }
 
 void MainWindow::updateStatusFromResponse(const PaProtocol::Response& response) {
