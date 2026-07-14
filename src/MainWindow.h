@@ -25,11 +25,15 @@
 
 class QCheckBox;
 class QComboBox;
+class QDockWidget;
+class QMenu;
 class QPushButton;
 class QSlider;
 class QAction;
 class FramePresentationController;
 class ImageListPanel;
+class AppLogService;
+class AppSettings;
 class PaDeviceController;
 enum class PaDeviceState;
 struct PaDeviceStatus;
@@ -47,6 +51,7 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QWidget* parent = nullptr);
     explicit MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* parent = nullptr);
+    ~MainWindow() override;
 
 private slots:
     void openImage();
@@ -58,6 +63,8 @@ private slots:
     void sendCommand(PaProtocol::Command command);
     void updateWindowLevel();
     void toggleImageMaximized();
+    void exportDiagnostics();
+    void configureCommandTimeout();
 
 private:
     QWidget* createTopBar();
@@ -65,9 +72,9 @@ private:
     QWidget* createImageOpsPanel();
     QWidget* createWindowLevelPanel();
     QWidget* createImageInfoPanel();
+    void createLogDock();
     void createMenus();
     void createStatusBar();
-    void appendLog(const QString& text);
     void handleImageListSelection(const QString& path);
     void handleImagesRemoved(int count, const QString& nextPath);
     void exportImage(const QString& sourcePath, const QString& formatId);
@@ -88,7 +95,9 @@ private:
     void updateInterruptCount(quint64 count);
 
     SerialClient serial_;
+    std::unique_ptr<AppSettings> settings_;
     std::unique_ptr<ImageSession> imageSession_;
+    AppLogService* logService_ = nullptr;
     LocalReplaySource* replaySource_ = nullptr;
     FramePresentationController* presentationController_ = nullptr;
     PaDeviceController* deviceController_ = nullptr;
@@ -97,7 +106,9 @@ private:
     ImageListPanel* imageListPanel_ = nullptr;
     QWidget* rightPanel_ = nullptr;
     ImageView* imageView_ = nullptr;
-    QTextEdit* logView_ = nullptr;
+    QDockWidget* logDock_ = nullptr;
+    QPlainTextEdit* logView_ = nullptr;
+    QMenu* viewMenu_ = nullptr;
     QAction* imageMaximizeAction_ = nullptr;
     QAction* refreshPortsAction_ = nullptr;
     QAction* connectSerialAction_ = nullptr;

@@ -1,5 +1,7 @@
 #include "MainWindow.h"
 
+#include "AppLogService.h"
+#include "AppSettings.h"
 #include "FramePresentationController.h"
 #include "ImageExportService.h"
 #include "ImageListPanel.h"
@@ -15,6 +17,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QDockWidget>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
@@ -23,18 +26,19 @@
 #include <QInputDialog>
 #include <QKeySequence>
 #include <QMenuBar>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPushButton>
 #include <QScreen>
 #include <QSerialPortInfo>
-#include <QSettings>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QStatusBar>
+#include <QTextDocument>
 #include <QWidgetAction>
 
 #include <algorithm>
@@ -83,9 +87,8 @@ void populateSerialPorts(QComboBox* combo) {
     }
 }
 
-QString defaultImageDirectory() {
-    QSettings settings;
-    const QString remembered = settings.value(QStringLiteral("paths/lastImageDirectory")).toString();
+QString defaultImageDirectory(const AppSettings& settings) {
+    const QString remembered = settings.lastImageDirectory();
     if (!remembered.isEmpty() && QDir(remembered).exists()) {
         return remembered;
     }
@@ -103,6 +106,20 @@ QString defaultImageDirectory() {
 
 QString normalizedImagePath(const QString& path) {
     return QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+}
+
+QString deviceStateName(PaDeviceState state) {
+    switch (state) {
+    case PaDeviceState::Disconnected:
+        return QStringLiteral("Disconnected");
+    case PaDeviceState::Ready:
+        return QStringLiteral("Ready");
+    case PaDeviceState::Busy:
+        return QStringLiteral("Busy");
+    case PaDeviceState::Error:
+        return QStringLiteral("Error");
+    }
+    return QStringLiteral("Unknown");
 }
 
 QPixmap drawAnalysisPreview(const QImage& image, const QRect& roi, const QSize& size) {
@@ -208,12 +225,28 @@ MainWindow::MainWindow(QWidget* parent)
     : MainWindow(std::make_shared<BuiltinImageAlgorithms>(), parent) {
 }
 
+MainWindow::~MainWindow() {
+    if (logService_ != nullptr) {
+        logService_->info(QStringLiteral("SYSTEM"), QStringLiteral("应用正常退出"));
+    }
+    if (settings_ != nullptr) {
+        settings_->sync();
+    }
+}
+
 MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* parent)
     : QMainWindow(parent) {
+    settings_ = std::make_unique<AppSettings>();
+    logService_ = new AppLogService(this);
+    QString logError;
+    if (!logService_->start(QString(), &logError)) {
+        qWarning().noquote() << logError;
+    }
     imageSession_ = std::make_unique<ImageSession>(std::move(algorithms), this);
     replaySource_ = new LocalReplaySource(this);
     presentationController_ = new FramePresentationController(this);
     deviceController_ = new PaDeviceController(&serial_, this);
+    deviceController_->setCommandTimeoutMs(settings_->commandTimeoutMs());
     replayDisplayCache_.setMaxCost(4);
     setWindowTitle(QStringLiteral("PA Host"));
     setMinimumSize(1180, 820);
@@ -247,7 +280,17 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     rootLayout->addWidget(splitter, 1);
 
     setCentralWidget(root);
+    createLogDock();
     createStatusBar();
+
+    connect(logService_, &AppLogService::entryAdded, this, [this](const AppLogEntry& entry) {
+        if (logView_ != nullptr) {
+            logView_->appendPlainText(entry.formatted());
+        }
+    });
+    connect(logService_, &AppLogService::persistenceError, this, [](const QString& message) {
+        qWarning().noquote() << message;
+    });
 
     connect(deviceController_, &PaDeviceController::stateChanged,
         this, &MainWindow::updateDeviceState);
@@ -256,20 +299,22 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     connect(deviceController_, &PaDeviceController::interruptReceived,
         this, &MainWindow::updateInterruptCount);
     connect(deviceController_, &PaDeviceController::lineTransmitted, this, [this](const QString& line) {
-        appendLog(QStringLiteral("TX: %1").arg(line));
+        logService_->info(QStringLiteral("RS422"), QStringLiteral("TX: %1").arg(line));
     });
     connect(deviceController_, &PaDeviceController::lineReceived, this, [this](const QString& line) {
-        appendLog(QStringLiteral("RX: %1").arg(line));
+        logService_->info(QStringLiteral("RS422"), QStringLiteral("RX: %1").arg(line));
     });
     connect(deviceController_, &PaDeviceController::errorOccurred, this, [this](const QString& message) {
-        appendLog(QStringLiteral("控制错误: %1").arg(message));
+        logService_->error(QStringLiteral("RS422"), QStringLiteral("控制错误: %1").arg(message));
     });
     connect(deviceController_, &PaDeviceController::commandFinished, this,
         [this](PaProtocol::Command command, bool success, const QString& detail) {
-            appendLog(QStringLiteral("命令%1: %2, %3")
-                          .arg(success ? QStringLiteral("完成") : QStringLiteral("失败"))
-                          .arg(PaProtocol::commandName(command), detail));
-    });
+            const QString message = QStringLiteral("命令%1: %2, %3")
+                                        .arg(success ? QStringLiteral("完成") : QStringLiteral("失败"))
+                                        .arg(PaProtocol::commandName(command), detail);
+            logService_->log(success ? AppLogLevel::Info : AppLogLevel::Warning,
+                QStringLiteral("RS422"), message);
+        });
     connect(imageView_, &ImageView::zoomChanged, this, [this](int percent) {
         progressLabel_->setText(QStringLiteral("缩放: %1%").arg(percent));
     });
@@ -291,18 +336,19 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
                                    .arg(targetFps));
         });
     connect(replaySource_, &LocalReplaySource::sourceError, this, [this](const QString& message) {
-        appendLog(message);
+        logService_->warning(QStringLiteral("IMAGE"), message);
     });
     connect(replaySource_, &LocalReplaySource::runningChanged, this, [this](bool running) {
         if (!running) {
             const ImageSourceStats stats = replaySource_->stats();
             presentationController_->stop();
             const FramePresentationStats presentationStats = presentationController_->stats();
-            appendLog(QStringLiteral("图像回放停止: 输入 %1 帧，显示 %2 帧，显示丢帧 %3，加载失败 %4")
-                          .arg(stats.deliveredFrames)
-                          .arg(presentationStats.presentedFrames)
-                          .arg(presentationStats.droppedFrames)
-                          .arg(stats.failedFrames));
+            logService_->info(QStringLiteral("IMAGE"),
+                QStringLiteral("图像回放停止: 输入 %1 帧，显示 %2 帧，显示丢帧 %3，加载失败 %4")
+                    .arg(stats.deliveredFrames)
+                    .arg(presentationStats.presentedFrames)
+                    .arg(presentationStats.droppedFrames)
+                    .arg(stats.failedFrames));
         }
     });
     imageRefreshTimer_.setSingleShot(true);
@@ -314,11 +360,13 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     imageInfoRefreshTimer_.setSingleShot(true);
     connect(&imageInfoRefreshTimer_, &QTimer::timeout, this, &MainWindow::updateFullImageInfo);
     updateDeviceState(deviceController_->state());
+    logService_->info(QStringLiteral("SYSTEM"),
+        QStringLiteral("应用启动，日志目录: %1").arg(logService_->logDirectory()));
 }
 
 void MainWindow::openImage() {
     stopImageReplay();
-    const QString initialDirectory = defaultImageDirectory();
+    const QString initialDirectory = defaultImageDirectory(*settings_);
     const QStringList paths = QFileDialog::getOpenFileNames(
         this,
         QStringLiteral("打开 TiRaw 图像（可多选）"),
@@ -328,7 +376,7 @@ void MainWindow::openImage() {
         return;
     }
 
-    QSettings().setValue(QStringLiteral("paths/lastImageDirectory"), QFileInfo(paths.first()).absolutePath());
+    settings_->setLastImageDirectory(QFileInfo(paths.first()).absolutePath());
 
     TiRawImage lastImage;
     QString lastPath;
@@ -371,7 +419,7 @@ void MainWindow::startImageReplay() {
     const QStringList paths = QFileDialog::getOpenFileNames(
         this,
         QStringLiteral("选择回放 TiRaw 序列"),
-        defaultImageDirectory(),
+        defaultImageDirectory(*settings_),
         QStringLiteral("TiRayRaw (*.tiraw);;All Files (*)"));
     if (paths.isEmpty()) {
         return;
@@ -385,7 +433,7 @@ void MainWindow::startImageReplay() {
     }
 
     stopImageReplay();
-    QSettings().setValue(QStringLiteral("paths/lastImageDirectory"), QFileInfo(paths.first()).absolutePath());
+    settings_->setLastImageDirectory(QFileInfo(paths.first()).absolutePath());
     replaySource_->setPlaylist(paths);
     replaySource_->setIntervalMs(std::max(1, 1000 / fps));
     replaySource_->setLoopEnabled(true);
@@ -414,11 +462,12 @@ void MainWindow::startImageReplay() {
     imageView_->setPixmapCacheEnabled(true);
     // 预加载完成后再启动计时，实际 FPS 不包含文件读取耗时。
     presentationController_->start(fps);
-    appendLog(QStringLiteral("开始图像回放: 预加载 %1/%2 帧，耗时 %3 ms，目标 %4 fps")
-                  .arg(loadedFrames)
-                  .arg(paths.size())
-                  .arg(preloadMs)
-                  .arg(fps));
+    logService_->info(QStringLiteral("IMAGE"),
+        QStringLiteral("开始图像回放: 预加载 %1/%2 帧，耗时 %3 ms，目标 %4 fps")
+            .arg(loadedFrames)
+            .arg(paths.size())
+            .arg(preloadMs)
+            .arg(fps));
 }
 
 void MainWindow::stopImageReplay() {
@@ -441,10 +490,9 @@ void MainWindow::saveDisplayImage() {
         return;
     }
 
-    QSettings settings;
-    QString saveDirectory = settings.value(QStringLiteral("paths/lastSaveDirectory")).toString();
+    QString saveDirectory = settings_->lastSaveDirectory();
     if (saveDirectory.isEmpty() || !QDir(saveDirectory).exists()) {
-        saveDirectory = defaultImageDirectory();
+        saveDirectory = defaultImageDirectory(*settings_);
     }
 
     const QString path = QFileDialog::getSaveFileName(
@@ -460,8 +508,8 @@ void MainWindow::saveDisplayImage() {
         QMessageBox::warning(this, QStringLiteral("保存失败"), QStringLiteral("图像保存失败"));
         return;
     }
-    settings.setValue(QStringLiteral("paths/lastSaveDirectory"), QFileInfo(path).absolutePath());
-    appendLog(QStringLiteral("保存显示图像: %1").arg(path));
+    settings_->setLastSaveDirectory(QFileInfo(path).absolutePath());
+    logService_->info(QStringLiteral("IMAGE"), QStringLiteral("保存显示图像: %1").arg(path));
 }
 
 void MainWindow::connectSerial() {
@@ -470,17 +518,88 @@ void MainWindow::connectSerial() {
         QMessageBox::warning(this, QStringLiteral("串口打开失败"), error);
         return;
     }
-    appendLog(QStringLiteral("串口已打开: %1 @ %2").arg(portCombo_->currentText()).arg(baudSpin_->value()));
+    settings_->setSerialPort(portCombo_->currentText());
+    settings_->setSerialBaudRate(baudSpin_->value());
+    logService_->info(QStringLiteral("RS422"),
+        QStringLiteral("串口已打开: %1 @ %2")
+            .arg(portCombo_->currentText())
+            .arg(baudSpin_->value()));
 }
 
 void MainWindow::disconnectSerial() {
     deviceController_->disconnectDevice();
-    appendLog(QStringLiteral("串口已关闭"));
+    logService_->info(QStringLiteral("RS422"), QStringLiteral("串口已关闭"));
 }
 
 void MainWindow::sendCommand(PaProtocol::Command command) {
     QString error;
     deviceController_->sendCommand(command, &error);
+}
+
+void MainWindow::exportDiagnostics() {
+    QString directory = settings_->lastDiagnosticDirectory();
+    if (directory.isEmpty() || !QDir(directory).exists()) {
+        directory = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    }
+    if (directory.isEmpty()) {
+        directory = QDir::homePath();
+    }
+
+    const QString defaultName = QStringLiteral("pa_host_diagnostics_%1.txt")
+                                    .arg(QDateTime::currentDateTime().toString(
+                                        QStringLiteral("yyyyMMdd-HHmmss")));
+    QString outputPath = QFileDialog::getSaveFileName(
+        this,
+        QStringLiteral("导出诊断信息"),
+        QDir(directory).filePath(defaultName),
+        QStringLiteral("Text File (*.txt)"));
+    if (outputPath.isEmpty()) {
+        return;
+    }
+    if (QFileInfo(outputPath).suffix().isEmpty()) {
+        outputPath += QStringLiteral(".txt");
+    }
+
+    QMap<QString, QString> metadata;
+    metadata.insert(QStringLiteral("serial.port"), portCombo_->currentText());
+    metadata.insert(QStringLiteral("serial.baud"), QString::number(baudSpin_->value()));
+    metadata.insert(QStringLiteral("control.command_timeout_ms"),
+        QString::number(deviceController_->commandTimeoutMs()));
+    metadata.insert(QStringLiteral("control.device_state"),
+        deviceStateName(deviceController_->state()));
+    metadata.insert(QStringLiteral("log.directory"), logService_->logDirectory());
+
+    QString error;
+    if (!logService_->exportDiagnostics(outputPath, metadata, &error)) {
+        QMessageBox::warning(this, QStringLiteral("导出失败"), error);
+        logService_->error(QStringLiteral("SYSTEM"),
+            QStringLiteral("导出诊断信息失败: %1").arg(error));
+        return;
+    }
+    settings_->setLastDiagnosticDirectory(QFileInfo(outputPath).absolutePath());
+    logService_->info(QStringLiteral("SYSTEM"),
+        QStringLiteral("导出诊断信息: %1").arg(outputPath));
+}
+
+void MainWindow::configureCommandTimeout() {
+    bool accepted = false;
+    const int timeoutMs = QInputDialog::getInt(
+        this,
+        QStringLiteral("命令超时设置"),
+        QStringLiteral("响应超时 (ms)"),
+        deviceController_->commandTimeoutMs(),
+        100,
+        300000,
+        100,
+        &accepted);
+    if (!accepted) {
+        return;
+    }
+
+    deviceController_->setCommandTimeoutMs(timeoutMs);
+    settings_->setCommandTimeoutMs(timeoutMs);
+    logService_->info(QStringLiteral("SYSTEM"),
+        QStringLiteral("命令响应超时设置为 %1 ms").arg(timeoutMs));
 }
 
 void MainWindow::updateWindowLevel() {
@@ -684,6 +803,26 @@ QWidget* MainWindow::createImageInfoPanel() {
     return group;
 }
 
+void MainWindow::createLogDock() {
+    logDock_ = new QDockWidget(QStringLiteral("运行日志"), this);
+    logDock_->setObjectName(QStringLiteral("runtimeLogDock"));
+    logDock_->setAllowedAreas(Qt::BottomDockWidgetArea);
+    logView_ = new QPlainTextEdit(logDock_);
+    logView_->setObjectName(QStringLiteral("runtimeLogView"));
+    logView_->setReadOnly(true);
+    logView_->setLineWrapMode(QPlainTextEdit::NoWrap);
+    logView_->document()->setMaximumBlockCount(2000);
+    logDock_->setWidget(logView_);
+    addDockWidget(Qt::BottomDockWidgetArea, logDock_);
+    logDock_->hide();
+
+    if (viewMenu_ != nullptr) {
+        QAction* toggleAction = logDock_->toggleViewAction();
+        toggleAction->setText(QStringLiteral("运行日志"));
+        viewMenu_->addAction(toggleAction);
+    }
+}
+
 void MainWindow::createMenus() {
     auto* fileMenu = menuBar()->addMenu(QStringLiteral("文件"));
     auto* openAction = fileMenu->addAction(QStringLiteral("打开 TiRaw 图像"));
@@ -704,6 +843,9 @@ void MainWindow::createMenus() {
     portLabelAction->setEnabled(false);
     portCombo_ = new QComboBox(serialMenu);
     populateSerialPorts(portCombo_);
+    if (!settings_->serialPort().isEmpty()) {
+        portCombo_->setCurrentText(settings_->serialPort());
+    }
     auto* portAction = new QWidgetAction(serialMenu);
     portAction->setDefaultWidget(portCombo_);
     serialMenu->addAction(portAction);
@@ -712,7 +854,7 @@ void MainWindow::createMenus() {
     baudLabelAction->setEnabled(false);
     baudSpin_ = new QSpinBox(serialMenu);
     baudSpin_->setRange(1200, 3000000);
-    baudSpin_->setValue(115200);
+    baudSpin_->setValue(settings_->serialBaudRate());
     auto* baudAction = new QWidgetAction(serialMenu);
     baudAction->setDefaultWidget(baudSpin_);
     serialMenu->addAction(baudAction);
@@ -750,14 +892,16 @@ void MainWindow::createMenus() {
         deviceCommandActions_.push_back(action);
     }
 
-    auto* viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
-    imageMaximizeAction_ = viewMenu->addAction(QStringLiteral("图像最大化"));
+    viewMenu_ = menuBar()->addMenu(QStringLiteral("视图"));
+    imageMaximizeAction_ = viewMenu_->addAction(QStringLiteral("图像最大化"));
     imageMaximizeAction_->setCheckable(true);
     imageMaximizeAction_->setShortcut(QKeySequence(Qt::Key_F11));
     connect(imageMaximizeAction_, &QAction::triggered, this, &MainWindow::toggleImageMaximized);
 
     menuBar()->addMenu(QStringLiteral("校准"));
-    menuBar()->addMenu(QStringLiteral("工具"));
+    auto* toolsMenu = menuBar()->addMenu(QStringLiteral("工具"));
+    toolsMenu->addAction(QStringLiteral("命令超时设置"), this, &MainWindow::configureCommandTimeout);
+    toolsMenu->addAction(QStringLiteral("导出诊断信息"), this, &MainWindow::exportDiagnostics);
     menuBar()->addMenu(QStringLiteral("帮助"));
 }
 
@@ -791,16 +935,6 @@ void MainWindow::createStatusBar() {
     statusBar()->addWidget(fpsLabel_);
 }
 
-void MainWindow::appendLog(const QString& text) {
-    const QString now = QDateTime::currentDateTime().toString("HH:mm:ss.zzz");
-    const QString line = QStringLiteral("[%1] %2").arg(now, text);
-    if (logView_ != nullptr) {
-        logView_->append(line);
-    } else {
-        qInfo().noquote() << line;
-    }
-}
-
 void MainWindow::handleImageListSelection(const QString& path) {
     if (path.isEmpty()) {
         return;
@@ -810,7 +944,8 @@ void MainWindow::handleImageListSelection(const QString& path) {
     QString error;
     if (!imageSession_->loadFile(path, &error)) {
         QMessageBox::warning(this, QStringLiteral("打开失败"), error);
-        appendLog(QStringLiteral("切换图像失败: %1, %2").arg(path, error));
+        logService_->error(QStringLiteral("IMAGE"),
+            QStringLiteral("切换图像失败: %1, %2").arg(path, error));
         return;
     }
     imageListPanel_->ensureThumbnail(path, imageSession_->image());
@@ -819,7 +954,8 @@ void MainWindow::handleImageListSelection(const QString& path) {
 
 void MainWindow::handleImagesRemoved(int count, const QString& nextPath) {
     stopImageReplay();
-    appendLog(QStringLiteral("从图像列表移除 %1 项（源文件未删除）").arg(count));
+    logService_->info(QStringLiteral("IMAGE"),
+        QStringLiteral("从图像列表移除 %1 项（源文件未删除）").arg(count));
     if (nextPath.isEmpty()) {
         clearCurrentImage();
     } else {
@@ -840,8 +976,7 @@ void MainWindow::exportImage(const QString& sourcePath, const QString& formatId)
         }
     }
 
-    QSettings settings;
-    QString exportDirectory = settings.value(QStringLiteral("paths/lastExportDirectory")).toString();
+    QString exportDirectory = settings_->lastExportDirectory();
     if (exportDirectory.isEmpty() || !QDir(exportDirectory).exists()) {
         exportDirectory = QFileInfo(sourcePath).absolutePath();
     }
@@ -874,8 +1009,9 @@ void MainWindow::exportImage(const QString& sourcePath, const QString& formatId)
         QMessageBox::warning(this, QStringLiteral("导出失败"), error);
         return;
     }
-    settings.setValue(QStringLiteral("paths/lastExportDirectory"), QFileInfo(outputPath).absolutePath());
-    appendLog(QStringLiteral("导出图像: %1 -> %2").arg(sourcePath, outputPath));
+    settings_->setLastExportDirectory(QFileInfo(outputPath).absolutePath());
+    logService_->info(QStringLiteral("IMAGE"),
+        QStringLiteral("导出图像: %1 -> %2").arg(sourcePath, outputPath));
 }
 
 void MainWindow::showCurrentSessionImage(const QString& source, bool resetViewState) {
@@ -890,14 +1026,15 @@ void MainWindow::showCurrentSessionImage(const QString& source, bool resetViewSt
     pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
     updateFullImageInfo();
     const WindowLevelResult autoWindow = imageSession_->autoWindowLevel();
-    appendLog(QStringLiteral("打开图像: %1, %2x%3, min=%4 max=%5, auto center=%6 width=%7")
-                  .arg(source)
-                  .arg(image.width())
-                  .arg(image.height())
-                  .arg(image.minValue())
-                  .arg(image.maxValue())
-                  .arg(autoWindow.center)
-                  .arg(autoWindow.width));
+    logService_->info(QStringLiteral("IMAGE"),
+        QStringLiteral("打开图像: %1, %2x%3, min=%4 max=%5, auto center=%6 width=%7")
+            .arg(source)
+            .arg(image.width())
+            .arg(image.height())
+            .arg(image.minValue())
+            .arg(image.maxValue())
+            .arg(autoWindow.center)
+            .arg(autoWindow.width));
     refreshImage(resetViewState);
 }
 
@@ -1096,7 +1233,7 @@ void MainWindow::handleAnalysisRoi(const QRect& imageRect) {
         const QString directory = QFileDialog::getExistingDirectory(
             this,
             QStringLiteral("导出分析曲线"),
-            defaultImageDirectory());
+            defaultImageDirectory(*settings_));
         if (directory.isEmpty()) {
             return;
         }
@@ -1106,7 +1243,8 @@ void MainWindow::handleAnalysisRoi(const QRect& imageRect) {
             QMessageBox::warning(this, QStringLiteral("导出失败"), error);
             return;
         }
-        appendLog(QStringLiteral("导出分析曲线: %1").arg(directory));
+        logService_->info(QStringLiteral("ANALYSIS"),
+            QStringLiteral("导出分析曲线: %1").arg(directory));
     });
 
     rightLayout->addWidget(esfLabel);
@@ -1158,7 +1296,8 @@ void MainWindow::handlePresentedFrame(const ImageFrame& frame) {
         || imageSession_->image().height() != frame.image.height();
     QString error;
     if (!imageSession_->setFrame(frame, &error)) {
-        appendLog(QStringLiteral("接收图像帧失败: %1").arg(error));
+        logService_->error(QStringLiteral("IMAGE"),
+            QStringLiteral("接收图像帧失败: %1").arg(error));
         return;
     }
 

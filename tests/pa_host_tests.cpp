@@ -1,3 +1,5 @@
+#include "AppLogService.h"
+#include "AppSettings.h"
 #include "FramePresentationController.h"
 #include "ILineTransport.h"
 #include "ImageAlgorithms.h"
@@ -11,8 +13,10 @@
 #include "TiRawImage.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QEventLoop>
 #include <QFile>
+#include <QFileInfo>
 #include <QTemporaryDir>
 
 #include <cmath>
@@ -161,6 +165,101 @@ bool testProtocolResponses() {
     CHECK(!empty.ok);
     CHECK(!empty.error);
     CHECK(empty.keyword.isEmpty());
+    return true;
+}
+
+bool testAppSettings() {
+    QTemporaryDir directory;
+    CHECK(directory.isValid());
+    const QString settingsPath = directory.filePath(QStringLiteral("settings.ini"));
+
+    {
+        AppSettings settings(settingsPath);
+        CHECK(settings.serialBaudRate() == 115200);
+        CHECK(settings.commandTimeoutMs() == 5000);
+        settings.setLastImageDirectory(QStringLiteral("/tmp/images"));
+        settings.setLastSaveDirectory(QStringLiteral("/tmp/save"));
+        settings.setLastExportDirectory(QStringLiteral("/tmp/export"));
+        settings.setLastDiagnosticDirectory(QStringLiteral("/tmp/diagnostics"));
+        settings.setSerialPort(QStringLiteral("COM_TEST"));
+        settings.setSerialBaudRate(921600);
+        settings.setCommandTimeoutMs(12000);
+        settings.sync();
+    }
+
+    {
+        AppSettings settings(settingsPath);
+        CHECK(settings.lastImageDirectory() == QStringLiteral("/tmp/images"));
+        CHECK(settings.lastSaveDirectory() == QStringLiteral("/tmp/save"));
+        CHECK(settings.lastExportDirectory() == QStringLiteral("/tmp/export"));
+        CHECK(settings.lastDiagnosticDirectory() == QStringLiteral("/tmp/diagnostics"));
+        CHECK(settings.serialPort() == QStringLiteral("COM_TEST"));
+        CHECK(settings.serialBaudRate() == 921600);
+        CHECK(settings.commandTimeoutMs() == 12000);
+
+        settings.setSerialBaudRate(1);
+        settings.setCommandTimeoutMs(999999);
+        CHECK(settings.serialBaudRate() == 1200);
+        CHECK(settings.commandTimeoutMs() == 300000);
+    }
+    return true;
+}
+
+bool testAppLogService() {
+    QTemporaryDir directory;
+    CHECK(directory.isValid());
+
+    AppLogService service;
+    service.setRotationPolicy(1024, 2);
+    QVector<AppLogEntry> entries;
+    QStringList persistenceErrors;
+    QObject::connect(&service, &AppLogService::entryAdded,
+        [&entries](const AppLogEntry& entry) {
+            entries.push_back(entry);
+        });
+    QObject::connect(&service, &AppLogService::persistenceError,
+        [&persistenceErrors](const QString& message) {
+            persistenceErrors.push_back(message);
+        });
+
+    QString error;
+    CHECK(service.start(directory.path(), &error));
+    CHECK(service.isStarted());
+    CHECK(service.logDirectory() == directory.path());
+    CHECK(service.currentLogPath() == directory.filePath(QStringLiteral("pa_host.log")));
+
+    for (int index = 0; index < 40; ++index) {
+        service.info(QStringLiteral("test"),
+            QStringLiteral("message-%1-%2")
+                .arg(index)
+                .arg(QString(80, QLatin1Char('x'))));
+    }
+    service.error(QStringLiteral("diagnostic"), QStringLiteral("final-marker"));
+
+    CHECK(entries.size() == 41);
+    CHECK(entries.first().formatted().contains(QStringLiteral("[INFO] [TEST]")));
+    CHECK(entries.last().formatted().contains(QStringLiteral("[ERROR] [DIAGNOSTIC] final-marker")));
+    CHECK(persistenceErrors.isEmpty());
+    CHECK(QFileInfo::exists(directory.filePath(QStringLiteral("pa_host.log"))));
+    CHECK(QFileInfo::exists(directory.filePath(QStringLiteral("pa_host.1.log"))));
+    const QStringList logFiles = QDir(directory.path()).entryList(
+        {QStringLiteral("pa_host.log"), QStringLiteral("pa_host.*.log")},
+        QDir::Files);
+    CHECK(logFiles.size() <= 3);
+
+    QMap<QString, QString> metadata;
+    metadata.insert(QStringLiteral("fixture"), QStringLiteral("app-log-service"));
+    const QString diagnosticPath = directory.filePath(QStringLiteral("diagnostics.txt"));
+    CHECK(service.exportDiagnostics(diagnosticPath, metadata, &error));
+    QFile diagnosticFile(diagnosticPath);
+    CHECK(diagnosticFile.open(QIODevice::ReadOnly));
+    const QString diagnostic = QString::fromUtf8(diagnosticFile.readAll());
+    CHECK(diagnostic.contains(QStringLiteral("PA Host Diagnostics")));
+    CHECK(diagnostic.contains(QStringLiteral("fixture=app-log-service")));
+    CHECK(diagnostic.contains(QStringLiteral("[logs]")));
+    CHECK(diagnostic.contains(QStringLiteral("final-marker")));
+    CHECK(!service.exportDiagnostics(service.currentLogPath(), metadata, &error));
+    CHECK(error == QStringLiteral("诊断文件不能覆盖当前日志文件"));
     return true;
 }
 
@@ -698,6 +797,8 @@ int main(int argc, char* argv[]) {
     const TestCase tests[] = {
         {"protocol_commands", testProtocolCommands},
         {"protocol_responses", testProtocolResponses},
+        {"app_settings", testAppSettings},
+        {"app_log_service", testAppLogService},
         {"pa_device_controller", testPaDeviceController},
         {"tiraw_parsing_and_roi", testTirawParsingAndRoi},
         {"auto_window_level", testAutoWindowLevel},

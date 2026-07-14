@@ -11,6 +11,8 @@ pa_host（Qt 界面）
         +---- ImageListPanel -------- 缩略图、选择、移除、右键命令
         +---- ImageView ------------- 显示、变换和 ROI 交互
         +---- ImageExportService ---- 原始/显示格式编码
+        +---- AppLogService --------- 分级日志、滚动文件和诊断导出
+        +---- AppSettings ----------- 稳定配置键、默认值和范围
         +---- FramePresentationController -- 最新帧、限速和统计
         |        |
         |        +---- ReplayPresentationScheduler -- 纯时间计算
@@ -27,7 +29,8 @@ pa_host（Qt 界面）
         |                                  +-- 当前窗宽窗位算法
         |
         +---- pa_core
-        |       TiRawImage / PaProtocol / PaDeviceController / 图像算法接口
+        |       TiRawImage / PaProtocol / PaDeviceController
+        |       AppLogService / AppSettings / 图像算法接口
         |
         +---- pa_transport
                 SerialClient（ILineTransport 的 RS422 实现）
@@ -86,8 +89,31 @@ FramePresentationController
 MainWindow
     打开文件对话框并维护 ImageSession
     连接列表、呈现控制器、导出服务和 ImageView
-    维护仅与当前窗口生命周期有关的显示缓存和状态标签
+    连接日志显示、设备状态、显示缓存和状态标签
 ```
+
+## 日志与配置
+
+`MainWindow` 不直接创建 `QSettings`，也不负责拼接日志时间。当前边界如下：
+
+```text
+AppSettings
+    保留现有 paths/lastImageDirectory 等配置键
+    保存串口、波特率、命令超时和最近使用目录
+    对波特率和超时执行统一范围限制
+
+AppLogService
+    生成 timestamp / level / category / message 结构化条目
+    同一条日志通过信号发送给界面，并写入 UTF-8 文件
+    默认单文件 5 MiB，保留 5 个 pa_host.N.log 归档
+    原子导出环境信息、调用方元数据和文本日志
+```
+
+运行日志 Dock 默认隐藏，不占用右侧图像操作区域。日志文件位于
+`QStandardPaths::AppLocalDataLocation/logs`，因此 Kylin 和 Windows 都写入当前用户的
+应用数据目录，不写工程目录。诊断导出明确不接收 `TiRawImage` 或像素缓冲区；当前只
+包含应用版本、Qt/OS/CPU、设备状态、串口参数和文本日志。日志中可能包含用户主动打开
+的文件路径，但不会嵌入图像内容。
 
 ## 图像输入链路
 

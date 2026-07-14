@@ -199,6 +199,7 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     QApplication::setStyle(QStyleFactory::create("Fusion"));
     QApplication::setApplicationName("PA Host");
+    QApplication::setApplicationVersion(QStringLiteral(PA_HOST_VERSION));
     QApplication::setOrganizationName("TiRay");
     app.setStyleSheet(QString::fromUtf8(kAppStyleSheet));
 

@@ -20,6 +20,10 @@ find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets SerialPort)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets SerialPort)
 
 add_library(pa_core STATIC
+    src/AppLogService.cpp
+    src/AppLogService.h
+    src/AppSettings.cpp
+    src/AppSettings.h
     src/FramePresentationController.cpp
     src/FramePresentationController.h
     src/ILineTransport.cpp
@@ -77,6 +81,7 @@ target_link_libraries(pa_host PRIVATE
     pa_core
     Qt${QT_VERSION_MAJOR}::Widgets
 )
+target_compile_definitions(pa_host PRIVATE PA_HOST_VERSION="${PROJECT_VERSION}")
 
 # A MinGW executable needs the runtime DLLs from the compiler that produced it.
 # Keep them beside the executable so direct launches do not depend on PATH.

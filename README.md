@@ -17,6 +17,8 @@ RS422 与 ARM pa_controller 通讯
 
 ```text
 src/MainWindow.*     Qt 主窗口，负责菜单、图像交互、ROI/分析弹窗、窗宽窗位
+src/AppLogService.*  分级运行日志、文件滚动和诊断文本导出
+src/AppSettings.*    最近目录、串口参数和命令超时配置
 src/ImageListPanel.* 左侧图像列表、缩略图、选择、移除和右键菜单
 src/ImageExportService.* 原始图像和显示图像导出服务
 src/ImageAlgorithms.* 图像算法接口和当前内置实现，旧算法从这里替换
@@ -37,6 +39,7 @@ doc/git-commit-note-20260714.md 架构解耦与图像回放阶段的中文提交
 doc/git-commit-note-20260714-image-list-replay-performance.md 图像列表、导出与回放性能阶段的中文提交说明
 doc/git-commit-note-20260714-ui-replay-decoupling.md 图像界面与回放呈现解耦阶段的中文提交说明
 doc/git-commit-note-20260714-device-control-decoupling.md RS422 设备控制链路解耦阶段的中文提交说明
+doc/git-commit-note-20260714-logging-settings.md 运行日志与应用配置基础设施阶段的中文提交说明
 ```
 
 ## 构建
@@ -105,6 +108,8 @@ ctest --output-on-failure
 ```text
 PA/ARM 命令字符串和 OK/ERR 响应解析
 PA 设备连接、单命令在途、STATUS/IRQ、超时和传输错误恢复
+AppSettings 配置默认值、持久化和数值边界
+AppLogService 日志格式、滚动归档和诊断导出
 .tiraw 正常文件头、尺寸、像素读取
 .tiraw 错误魔数、错误位深、长度不匹配和短文件
 0.6% ~ 99.4% 自动窗宽窗位
@@ -136,6 +141,8 @@ pa_image_benchmark 真实 TiRaw 性能基准工具
 `MainWindow` 只负责模块组装和跨模块工作流：图像列表内部行为由 `ImageListPanel` 管理，文件编码由 `ImageExportService` 管理，回放帧选择、限速和统计由 `FramePresentationController` 管理，纯时间计算由 `ReplayPresentationScheduler` 管理。主窗口不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
 
 RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命令、响应和 5 秒超时；`MainWindow` 不再解析 ASCII 响应。未连接或命令执行中时，PA/FPGA 命令会自动禁用。设备返回有效响应、发生超时或传输错误后，控制器会统一恢复或切换错误状态。错误状态下如果串口仍保持打开，可以直接重试命令。
+
+运行日志由 `AppLogService` 统一生成，格式包含时间、级别和来源，并写入应用数据目录下的 `logs/pa_host.log`。单个文件默认最多 5 MiB，保留 5 个归档。通过“视图 -> 运行日志”打开底部日志 Dock；“工具 -> 导出诊断信息”生成包含运行环境、控制参数和文本日志的诊断文件，不包含图像像素。“工具 -> 命令超时设置”可调整并保存响应超时。
 
 构建时启用 `BUILD_TESTING` 后，可以用真实的 2～3 帧序列复测预加载、显示转换、缩略图和全图统计耗时：
 
@@ -193,6 +200,8 @@ BMP / JPEG  导出当前窗宽窗位映射后的 8-bit 显示图像
 ```
 
 DCM 暂未实现。DICOM 需要明确设备、检查和图像元数据以及编码规范，不能只修改文件扩展名。
+
+配置会保存最近图像、保存、导出和诊断目录，以及最后成功连接的串口、波特率和命令超时。Kylin 使用 Qt 的用户配置目录，Windows 使用当前用户配置，工程目录不会生成配置文件。
 
 ## 与 ARM 的当前协议
 
@@ -283,6 +292,8 @@ Shift+ROI 按区域重算窗位窗宽
 图像列表右键导出 TiRaw、RAW16、PNG、TIFF、BMP 和 JPEG
 连续帧实际 FPS、错误和完成统计
 RS422 命令状态、超时和结构化 STATUS/IRQ 处理
+分级滚动日志、运行日志 Dock 和诊断文本导出
+串口参数、命令超时和最近目录持久化
 相同尺寸连续帧保持当前图像视图状态
 ESF / LSF / MTF 曲线 CSV 导出
 核心模块无硬件自动测试
