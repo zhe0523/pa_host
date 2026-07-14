@@ -5,7 +5,6 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QHash>
-#include <QListWidget>
 #include <QMainWindow>
 #include <QPlainTextEdit>
 #include <QPoint>
@@ -25,9 +24,10 @@
 
 class QCheckBox;
 class QComboBox;
-class QListWidgetItem;
 class QSlider;
 class QAction;
+class FramePresentationController;
+class ImageListPanel;
 
 /*
  * 主窗口。
@@ -58,7 +58,6 @@ private slots:
 
 private:
     QWidget* createTopBar();
-    QWidget* createImageListPanel();
     QWidget* createRightPanel();
     QWidget* createImageOpsPanel();
     QWidget* createWindowLevelPanel();
@@ -66,11 +65,9 @@ private:
     void createMenus();
     void createStatusBar();
     void appendLog(const QString& text);
-    QListWidgetItem* addOrUpdateImageListItem(const QString& path, const TiRawImage* image = nullptr);
-    QListWidgetItem* findImageListItem(const QString& path) const;
-    void handleImageListSelection(QListWidgetItem* item);
-    void removeSelectedImages();
-    void exportCurrentImage(const QString& formatId);
+    void handleImageListSelection(const QString& path);
+    void handleImagesRemoved(int count, const QString& nextPath);
+    void exportImage(const QString& sourcePath, const QString& formatId);
     void showCurrentSessionImage(const QString& source, bool resetViewState);
     void clearCurrentImage();
     void clearReplayDisplayCaches();
@@ -82,17 +79,17 @@ private:
     void updateFullImageInfo();
     void handleAnalysisRoi(const QRect& imageRect);
     void applyWindowLevelFromRoi(const QRect& imageRect);
-    void handleImageFrame(const ImageFrame& frame);
+    void handlePresentedFrame(const ImageFrame& frame);
     void updateStatusFromResponse(const PaProtocol::Response& response);
 
     SerialClient serial_;
     std::unique_ptr<ImageSession> imageSession_;
     LocalReplaySource* replaySource_ = nullptr;
+    FramePresentationController* presentationController_ = nullptr;
 
     QWidget* topBar_ = nullptr;
-    QWidget* imageListPanel_ = nullptr;
+    ImageListPanel* imageListPanel_ = nullptr;
     QWidget* rightPanel_ = nullptr;
-    QListWidget* imageList_ = nullptr;
     ImageView* imageView_ = nullptr;
     QTextEdit* logView_ = nullptr;
     QAction* imageMaximizeAction_ = nullptr;
@@ -120,15 +117,7 @@ private:
     QTimer imageInfoRefreshTimer_;
     QCache<QString, QImage> replayDisplayCache_;
     QHash<QString, TiRawImage::RoiStats> replayFullImageStatsCache_;
-    QElapsedTimer imagePresentationClock_;
-    QElapsedTimer replayFpsTimer_;
     QElapsedTimer imageInfoTimer_;
-    qint64 nextImagePresentationNs_ = 0;
-    quint64 replayFpsFrameCount_ = 0;
-    quint64 replayDisplayedFrames_ = 0;
-    quint64 replayDroppedDisplayFrames_ = 0;
-    int replayTargetFps_ = 30;
-    bool replayFramePending_ = false;
     bool resetViewStateOnRefresh_ = false;
     bool imageMaximized_ = false;
 };

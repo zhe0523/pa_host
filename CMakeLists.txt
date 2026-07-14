@@ -20,6 +20,10 @@ find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets SerialPort)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets SerialPort)
 
 add_library(pa_core STATIC
+    src/FramePresentationController.cpp
+    src/FramePresentationController.h
+    src/ImageExportService.cpp
+    src/ImageExportService.h
     src/ImageAlgorithms.cpp
     src/ImageAlgorithms.h
     src/ImageSession.cpp
@@ -30,6 +34,8 @@ add_library(pa_core STATIC
     src/MtfAnalysis.h
     src/PaProtocol.cpp
     src/PaProtocol.h
+    src/ReplayPresentationScheduler.cpp
+    src/ReplayPresentationScheduler.h
     src/TiRawImage.cpp
     src/TiRawImage.h
 )
@@ -53,6 +59,8 @@ target_link_libraries(pa_transport PUBLIC
 
 add_executable(pa_host
     src/main.cpp
+    src/ImageListPanel.cpp
+    src/ImageListPanel.h
     src/MainWindow.cpp
     src/MainWindow.h
     src/ImageView.cpp

@@ -1,8 +1,11 @@
+#include "FramePresentationController.h"
 #include "ImageAlgorithms.h"
+#include "ImageExportService.h"
 #include "ImageSession.h"
 #include "ImageSource.h"
 #include "MtfAnalysis.h"
 #include "PaProtocol.h"
+#include "ReplayPresentationScheduler.h"
 #include "TiRawImage.h"
 
 #include <QCoreApplication>
@@ -256,6 +259,111 @@ bool testImageSession() {
     return true;
 }
 
+bool testImageExportService() {
+    QTemporaryDir directory;
+    CHECK(directory.isValid());
+    const QString sourcePath = directory.filePath(QStringLiteral("export-source.tiraw"));
+    CHECK(writeTiraw(sourcePath, 2, 2, {10, 20, 30, 40}));
+
+    TiRawImage image;
+    QString error;
+    CHECK(image.load(sourcePath, &error));
+
+    ImageExportFormat format;
+    CHECK(ImageExportService::findFormat(QStringLiteral("tiraw"), &format));
+    CHECK(format.suffix == QStringLiteral("tiraw"));
+    CHECK(ImageExportService::isSupported(QStringLiteral("raw")));
+    CHECK(ImageExportService::ensureFileSuffix(
+              directory.filePath(QStringLiteral("raw-export")), QStringLiteral("raw"))
+        .endsWith(QStringLiteral(".raw")));
+
+    const QString rawPath = directory.filePath(QStringLiteral("service.raw"));
+    CHECK(ImageExportService::exportImage(image, 25, 30, QStringLiteral("raw"), rawPath, &error));
+    CHECK(QFileInfo(rawPath).size() == 8);
+
+    if (ImageExportService::isSupported(QStringLiteral("png"))) {
+        const QString pngPath = directory.filePath(QStringLiteral("service.png"));
+        CHECK(ImageExportService::exportImage(image, 25, 30, QStringLiteral("png"), pngPath, &error));
+        QImage exportedDisplay(pngPath);
+        CHECK(exportedDisplay.size() == QSize(2, 2));
+    }
+
+    CHECK(!ImageExportService::exportImage(
+        image, 25, 30, QStringLiteral("unknown"), directory.filePath(QStringLiteral("bad.bin")), &error));
+    CHECK(!error.isEmpty());
+    return true;
+}
+
+bool testReplayPresentationScheduler() {
+    ReplayPresentationScheduler scheduler;
+    scheduler.setTargetFps(60);
+    scheduler.reset();
+    CHECK(scheduler.targetFps() == 60);
+    CHECK(scheduler.delayMs(0) == 0);
+
+    scheduler.markPresented(0);
+    CHECK(scheduler.delayMs(16000000) == 1);
+    scheduler.markPresented(17000000);
+    CHECK(scheduler.delayMs(32000000) == 2);
+    scheduler.markPresented(34000000);
+    CHECK(scheduler.delayMs(49000000) == 1);
+
+    scheduler.markPresented(100000000);
+    CHECK(scheduler.delayMs(100000000) == 17);
+    scheduler.setTargetFps(0);
+    CHECK(scheduler.targetFps() == 1);
+    scheduler.setTargetFps(1000);
+    CHECK(scheduler.targetFps() == 120);
+    return true;
+}
+
+bool testFramePresentationController() {
+    FramePresentationController controller;
+    QVector<quint64> presentedSequences;
+    QObject::connect(&controller, &FramePresentationController::framePresented,
+        [&presentedSequences](const ImageFrame& frame) {
+            presentedSequences.push_back(frame.sequence);
+        });
+
+    controller.start(30);
+    for (quint64 sequence = 1; sequence <= 3; ++sequence) {
+        ImageFrame frame;
+        frame.sequence = sequence;
+        controller.submitFrame(frame);
+    }
+
+    QEventLoop firstPresentationLoop;
+    QTimer::singleShot(50, &firstPresentationLoop, &QEventLoop::quit);
+    firstPresentationLoop.exec();
+
+    FramePresentationStats stats = controller.stats();
+    CHECK(presentedSequences == QVector<quint64>({3}));
+    CHECK(stats.submittedFrames == 3);
+    CHECK(stats.presentedFrames == 1);
+    CHECK(stats.droppedFrames == 2);
+
+    ImageFrame pendingFrame;
+    pendingFrame.sequence = 4;
+    controller.submitFrame(pendingFrame);
+    controller.stop();
+    stats = controller.stats();
+    CHECK(!controller.isActive());
+    CHECK(stats.submittedFrames == 4);
+    CHECK(stats.presentedFrames == 1);
+    CHECK(stats.droppedFrames == 3);
+
+    // 每次开始回放都建立独立统计周期，避免上一次回放污染状态栏数据。
+    controller.start(60);
+    stats = controller.stats();
+    CHECK(controller.isActive());
+    CHECK(controller.targetFps() == 60);
+    CHECK(stats.submittedFrames == 0);
+    CHECK(stats.presentedFrames == 0);
+    CHECK(stats.droppedFrames == 0);
+    controller.stop();
+    return true;
+}
+
 bool testLocalReplaySource() {
     QTemporaryDir directory;
     CHECK(directory.isValid());
@@ -416,6 +524,9 @@ int main(int argc, char* argv[]) {
         {"auto_window_level", testAutoWindowLevel},
         {"image_algorithm_boundary", testImageAlgorithmBoundary},
         {"image_session", testImageSession},
+        {"image_export_service", testImageExportService},
+        {"replay_presentation_scheduler", testReplayPresentationScheduler},
+        {"frame_presentation_controller", testFramePresentationController},
         {"local_replay_source", testLocalReplaySource},
         {"invalid_tiraw_files", testInvalidTirawFiles},
         {"mtf_analysis_and_export", testMtfAnalysisAndExport},

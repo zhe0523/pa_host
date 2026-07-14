@@ -17,9 +17,13 @@ RS422 与 ARM pa_controller 通讯
 
 ```text
 src/MainWindow.*     Qt 主窗口，负责菜单、图像交互、ROI/分析弹窗、窗宽窗位
+src/ImageListPanel.* 左侧图像列表、缩略图、选择、移除和右键菜单
+src/ImageExportService.* 原始图像和显示图像导出服务
 src/ImageAlgorithms.* 图像算法接口和当前内置实现，旧算法从这里替换
 src/ImageSource.*    图像源抽象和本地 .tiraw 连续回放实现
 src/ImageSession.*   当前图像帧、显示渲染和算法调用的应用层边界
+src/FramePresentationController.* 最新帧选择、显示限速、实际 FPS 和丢帧统计
+src/ReplayPresentationScheduler.* 1～120 fps 显示时间调度策略
 src/SerialClient.*   RS422 串口按行收发
 src/PaProtocol.*     当前 ARM ASCII 命令和响应解析
 src/TiRawImage.*     Windows 样例 .tiraw 16-bit 灰度图读取、自动窗宽窗位、ROI 统计
@@ -29,6 +33,7 @@ doc/architecture.md   模块边界、算法替换和 PCIe 图像链路设计
 doc/git-commit-note-20260710.md 图像交互阶段的中文提交说明
 doc/git-commit-note-20260714.md 架构解耦与图像回放阶段的中文提交说明
 doc/git-commit-note-20260714-image-list-replay-performance.md 图像列表、导出与回放性能阶段的中文提交说明
+doc/git-commit-note-20260714-ui-replay-decoupling.md 图像界面与回放呈现解耦阶段的中文提交说明
 ```
 
 ## 构建
@@ -105,6 +110,9 @@ ROI 均值、最小/最大、标准差和行噪声
 图像算法接口的自动/ROI 窗宽窗位契约
 内存字节流解析为 TiRawImage
 ImageSession 文件加载、当前帧、ROI 和显示渲染
+ImageExportService 格式元数据、后缀、RAW16 和显示图导出
+ReplayPresentationScheduler 60 fps 补偿、迟到追帧和帧率边界
+FramePresentationController 最新帧覆盖、停止丢帧和统计周期重置
 LocalReplaySource 帧序号、停止状态、快速重启、坏文件跳过和统计
 ESF / LSF / MTF 基础分析与 CSV 导出
 ```
@@ -121,7 +129,7 @@ pa_host_tests 无界面核心测试
 pa_image_benchmark 真实 TiRaw 性能基准工具
 ```
 
-`MainWindow` 不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
+`MainWindow` 只负责模块组装和跨模块工作流：图像列表内部行为由 `ImageListPanel` 管理，文件编码由 `ImageExportService` 管理，回放帧选择、限速和统计由 `FramePresentationController` 管理，纯时间计算由 `ReplayPresentationScheduler` 管理。主窗口不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
 
 构建时启用 `BUILD_TESTING` 后，可以用真实的 2～3 帧序列复测预加载、显示转换、缩略图和全图统计耗时：
 
@@ -161,7 +169,7 @@ Shift+左键拖框：按 ROI 重新计算窗位/窗宽
 文件 -> 停止图像回放：停止本地回放
 ```
 
-回放使用和未来 PCIe 相同的 `IImageSource -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际显示 FPS。PCIe 尚未接入。
+回放使用和未来 PCIe 相同的 `IImageSource -> FramePresentationController -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际显示 FPS。PCIe 尚未接入。
 
 普通图像列表只保存文件路径和缩略图，不常驻缓存所有 16-bit 原始图像。点击列表项时重新加载对应文件；选中一项或多项后，可点击“移除选中图像”、按 Delete，或使用右键菜单移除。移除只影响列表，不会删除磁盘上的源文件。
 

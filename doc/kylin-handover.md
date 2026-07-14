@@ -122,11 +122,12 @@ ctest --output-on-failure
 
 当前覆盖协议解析、`.tiraw` 文件校验、像素读取、自动窗宽窗位、ROI 统计和显示映射。
 
-自动测试也覆盖 `ImageSession` 与本地连续回放源：回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
+自动测试也覆盖 `ImageSession`、`ImageExportService`、`ReplayPresentationScheduler`、`FramePresentationController` 与本地连续回放源：包括导出格式与写盘、60 fps 时间补偿、最新帧覆盖与丢帧统计、回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
 
-核心代码已经拆成 `pa_core`、`pa_transport` 和 `pa_host` 三个 CMake 目标。图像算法通过
-`IImageAlgorithms` 接口调用，后续拿到旧软件算法源码时不需要修改主窗口。架构说明见
-`doc/architecture.md`。
+核心代码已经拆成 `pa_core`、`pa_transport` 和 `pa_host` 三个 CMake 目标。图像列表、
+导出编码、回放呈现和帧率计算也已分别迁移到 `ImageListPanel`、`ImageExportService`、
+`FramePresentationController` 和 `ReplayPresentationScheduler`。图像算法通过 `IImageAlgorithms` 接口调用，后续拿到
+旧软件算法源码时不需要修改主窗口。架构说明见 `doc/architecture.md`。
 
 ### 1. 先测图像查看
 

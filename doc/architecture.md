@@ -6,11 +6,20 @@
 
 ```text
 pa_host（Qt 界面）
-  MainWindow / ImageView
+  MainWindow（模块组装与工作流）
+        |
+        +---- ImageListPanel -------- 缩略图、选择、移除、右键命令
+        +---- ImageView ------------- 显示、变换和 ROI 交互
+        +---- ImageExportService ---- 原始/显示格式编码
+        +---- FramePresentationController -- 最新帧、限速和统计
+        |        |
+        |        +---- ReplayPresentationScheduler -- 纯时间计算
         |
         +---- IImageSource ----------- LocalReplaySource
         |        |                         |
-        |        +---- ImageFrame ---------+---- ImageSession
+        |        +---- ImageFrame ---------+---- FramePresentationController
+        |                                      |
+        |                                      +---- ImageSession
         |
         +---- IImageAlgorithms -------- BuiltinImageAlgorithms
         |                                  |
@@ -27,7 +36,7 @@ pa_host（Qt 界面）
 CMake 目标：
 
 ```text
-pa_core       图像数据、协议解析和算法接口，不依赖窗口
+pa_core       图像数据、协议解析、算法接口、导出和显示调度策略，不依赖窗口
 pa_transport  串口收发基础设施
 pa_host       Qt Widgets 界面，只负责交互和模块组装
 pa_host_tests 无界面自动测试，只链接 pa_core
@@ -48,6 +57,38 @@ exportMtf        分析结果导出
 
 如果旧代码只提供部分算法，可以让新实现对已获得的算法调用旧代码，其余功能继续委托给 `BuiltinImageAlgorithms`，避免一次性迁移。
 
+## 主窗口边界
+
+`MainWindow` 不再直接操作 `QListWidgetItem`，也不保存导出格式表或计算 16/17 ms
+显示间隔。当前职责分配如下：
+
+```text
+ImageListPanel
+    保存列表项路径和缩略图状态
+    处理选择、批量移除、Delete 和右键菜单
+    向主窗口发送路径级命令，不暴露 QListWidgetItem
+
+ImageExportService
+    定义 TiRaw、RAW16、PNG、TIFF、BMP、JPEG 格式元数据
+    处理后缀、Qt 格式能力检查和实际写盘
+    不打开文件对话框，不依赖 MainWindow
+
+ReplayPresentationScheduler
+    根据目标 fps 计算下一次显示延迟
+    补偿 Qt 5 整数毫秒定时器误差和迟到帧
+    不持有图像、不依赖事件循环，可通过纯数值自动测试
+
+FramePresentationController
+    接收图像源输出，只保留最新待显示帧
+    管理呈现定时器、实际 FPS、显示计数和丢帧计数
+    不读取文件、不渲染图像，可直接复用于未来 PCIe 图像源
+
+MainWindow
+    打开文件对话框并维护 ImageSession
+    连接列表、呈现控制器、导出服务和 ImageView
+    维护仅与当前窗口生命周期有关的显示缓存和状态标签
+```
+
 ## 图像输入链路
 
 当前已经有统一的输入契约：
@@ -55,13 +96,14 @@ exportMtf        分析结果导出
 ```text
 本地单文件 / 本地连续回放 / 未来 PCIe
               -> IImageSource（完整 ImageFrame）
+              -> FramePresentationController（最新帧与呈现节拍）
               -> ImageSession（当前帧与算法调用）
               -> MainWindow / ImageView
 ```
 
 `LocalReplaySource` 已接入文件菜单，可选择多个 `.tiraw` 并以 1~120 fps 循环回放。它只负责产生完整帧、错误和统计；UI 不直接读取回放文件。连续同尺寸帧保留当前视图变换。首帧使用可取消的成员定时器异步投递，停止、快速重启和回调内重启通过运行代际隔离，旧回调不能启动新一轮定时器。
 
-当前回放序列固定为 2～3 帧，因此 `LocalReplaySource` 在启动时一次性加载有效帧，后续循环通过 Qt 隐式共享复用像素内存。主窗口最多缓存 4 张窗宽窗位映射后的 `QImage`，`ImageView` 在 128 MiB 上限内缓存对应 `QPixmap`。首帧立即提交，后续显示节拍跟随用户设置的 1～120 fps，并通过累计纳秒时间基准补偿 Qt 5 整数毫秒定时器的误差；来不及显示的中间帧计入显示丢帧，不进入无界队列。右侧全图 ROI 统计在首帧提交后延迟执行，最多每秒调度一次，并按固定帧路径缓存结果。上述按路径缓存只用于内容固定的本地回放，未来 PCIe 动态帧不能复用。
+当前回放序列固定为 2～3 帧，因此 `LocalReplaySource` 在启动时一次性加载有效帧，后续循环通过 Qt 隐式共享复用像素内存。主窗口最多缓存 4 张窗宽窗位映射后的 `QImage`，`ImageView` 在 128 MiB 上限内缓存对应 `QPixmap`。`FramePresentationController` 只保留最新待显示帧，显示节拍跟随用户设置的 1～120 fps；其内部使用 `ReplayPresentationScheduler` 的累计纳秒时间基准补偿 Qt 5 整数毫秒定时器误差。来不及显示的中间帧计入显示丢帧，不进入无界队列。右侧全图 ROI 统计在首帧提交后延迟执行，最多每秒调度一次，并按固定帧路径缓存结果。上述按路径缓存只用于内容固定的本地回放，未来 PCIe 动态帧不能复用。
 
 主窗口的普通图像列表保存文件路径和缩略图，不缓存每一项的完整 16-bit 像素。缩略图直接从原始像素降采样到目标尺寸，不构造完整显示图。用户切换列表项时重新加载对应文件，避免大量图像同时常驻造成内存快速增长。列表移除只删除 UI 项，不操作源文件。只有用户主动启动的小序列回放会在运行期间缓存所选原始帧。
 
