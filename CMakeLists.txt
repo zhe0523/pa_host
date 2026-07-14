@@ -65,6 +65,34 @@ target_link_libraries(pa_host PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
 )
 
+# A MinGW executable needs the runtime DLLs from the compiler that produced it.
+# Keep them beside the executable so direct launches do not depend on PATH.
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    get_filename_component(PA_MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(PA_MINGW_RUNTIME_DLLS)
+    foreach(runtime_dll
+        libgcc_s_seh-1.dll
+        libstdc++-6.dll
+        libwinpthread-1.dll
+    )
+        if(EXISTS "${PA_MINGW_RUNTIME_DIR}/${runtime_dll}")
+            list(APPEND PA_MINGW_RUNTIME_DLLS
+                "${PA_MINGW_RUNTIME_DIR}/${runtime_dll}"
+            )
+        endif()
+    endforeach()
+    if(PA_MINGW_RUNTIME_DLLS)
+        add_custom_target(pa_host_runtime
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${PA_MINGW_RUNTIME_DLLS}
+                "${CMAKE_CURRENT_BINARY_DIR}"
+            DEPENDS ${PA_MINGW_RUNTIME_DLLS}
+            VERBATIM
+        )
+        add_dependencies(pa_host pa_host_runtime)
+    endif()
+endif()
+
 function(pa_enable_warnings target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive-)
