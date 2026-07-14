@@ -9,8 +9,23 @@
 #include <algorithm>
 #include <cmath>
 
+namespace {
+constexpr int kPixmapCacheMiB = 128;
+constexpr qint64 kBytesPerMiB = 1024 * 1024;
+
+int pixmapCostMiB(const QPixmap& pixmap) {
+    const int bytesPerPixel = pixmap.depth() <= 8
+        ? 1
+        : std::max(4, (pixmap.depth() + 7) / 8);
+    const qint64 bytes = static_cast<qint64>(pixmap.width())
+        * pixmap.height() * bytesPerPixel;
+    return static_cast<int>(std::max<qint64>(1, (bytes + kBytesPerMiB - 1) / kBytesPerMiB));
+}
+}
+
 ImageView::ImageView(QWidget* parent)
     : QGraphicsView(parent) {
+    pixmapCache_.setMaxCost(kPixmapCacheMiB);
     setScene(&scene_);
     setRenderHint(QPainter::SmoothPixmapTransform, false);
     setDragMode(QGraphicsView::ScrollHandDrag);
@@ -28,6 +43,10 @@ void ImageView::setImage(const QImage& image, bool resetViewState) {
     const bool sizeChanged = image_.size() != image.size();
     image_ = image;
 
+    if (resetViewState && roiItem_ != nullptr) {
+        clearRoiOverlay();
+    }
+
     if (image_.isNull()) {
         scene_.clear();
         pixmapItem_ = nullptr;
@@ -35,14 +54,27 @@ void ImageView::setImage(const QImage& image, bool resetViewState) {
         return;
     }
 
+    QPixmap pixmap;
+    if (pixmapCacheEnabled_) {
+        const qint64 cacheKey = image_.cacheKey();
+        if (const QPixmap* cached = pixmapCache_.object(cacheKey)) {
+            pixmap = *cached;
+        } else {
+            pixmap = QPixmap::fromImage(image_);
+            pixmapCache_.insert(cacheKey, new QPixmap(pixmap), pixmapCostMiB(pixmap));
+        }
+    } else {
+        pixmap = QPixmap::fromImage(image_);
+    }
+
     if (pixmapItem_ == nullptr || sizeChanged) {
         scene_.clear();
         roiItem_ = nullptr;
-        pixmapItem_ = scene_.addPixmap(QPixmap::fromImage(image_));
+        pixmapItem_ = scene_.addPixmap(pixmap);
         pixmapItem_->setTransformationMode(Qt::FastTransformation);
         scene_.setSceneRect(pixmapItem_->boundingRect());
     } else {
-        pixmapItem_->setPixmap(QPixmap::fromImage(image_));
+        pixmapItem_->setPixmap(pixmap);
     }
 
     if (resetViewState || sizeChanged) {
@@ -57,6 +89,20 @@ void ImageView::setImage(const QImage& image, bool resetViewState) {
     } else {
         applyTransform();
     }
+}
+
+void ImageView::setPixmapCacheEnabled(bool enabled) {
+    if (pixmapCacheEnabled_ == enabled) {
+        return;
+    }
+    pixmapCacheEnabled_ = enabled;
+    if (!enabled) {
+        pixmapCache_.clear();
+    }
+}
+
+void ImageView::clearPixmapCache() {
+    pixmapCache_.clear();
 }
 
 bool ImageView::hasImage() const {

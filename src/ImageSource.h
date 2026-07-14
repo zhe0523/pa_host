@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QStringList>
 #include <QTimer>
+#include <QVector>
 
 #include "TiRawImage.h"
 
@@ -59,9 +60,12 @@ private:
     void deliverNext();
 
     QStringList playlist_;
+    QVector<ImageFrame> cachedFrames_;
+    QTimer initialDeliveryTimer_;
     QTimer timer_;
     int intervalMs_ = 33;
     int nextIndex_ = 0;
+    quint64 runGeneration_ = 0;
     bool loopEnabled_ = true;
     bool running_ = false;
     ImageSourceStats stats_;

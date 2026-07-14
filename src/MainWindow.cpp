@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include <QAction>
+#include <QAbstractItemView>
 #include <QBoxLayout>
 #include <QButtonGroup>
 #include <QCheckBox>
@@ -16,7 +17,10 @@
 #include <QGroupBox>
 #include <QGuiApplication>
 #include <QInputDialog>
+#include <QImageWriter>
+#include <QItemSelectionModel>
 #include <QKeySequence>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPainter>
@@ -30,6 +34,7 @@
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QStatusBar>
+#include <QStyle>
 #include <QWidgetAction>
 
 #include <algorithm>
@@ -37,6 +42,14 @@
 #include <utility>
 
 namespace {
+constexpr int kImagePathRole = Qt::UserRole + 1;
+constexpr int kThumbnailReadyRole = Qt::UserRole + 2;
+constexpr int kStaticImageRefreshIntervalMs = 33;
+constexpr qint64 kNanosecondsPerSecond = 1000000000LL;
+constexpr qint64 kNanosecondsPerMillisecond = 1000000LL;
+constexpr QSize kThumbnailSize(134, 82);
+constexpr QSize kImageListItemSize(146, 112);
+
 QSize initialWindowSize() {
     auto* screen = QGuiApplication::primaryScreen();
     if (screen == nullptr) {
@@ -92,6 +105,71 @@ QString defaultImageDirectory() {
 
     const QString picturesDirectory = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
     return picturesDirectory.isEmpty() ? QDir::homePath() : picturesDirectory;
+}
+
+QString normalizedImagePath(const QString& path) {
+    return QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+}
+
+QIcon makeImageThumbnail(const TiRawImage& image) {
+    QPixmap thumbnail(kThumbnailSize);
+    thumbnail.fill(Qt::white);
+    if (!image.isValid()) {
+        return QIcon(thumbnail);
+    }
+
+    const QSize scaledSize = QSize(image.width(), image.height()).scaled(kThumbnailSize, Qt::KeepAspectRatio);
+    const QImage scaled = image.toDisplayImage(
+        false, image.autoWindowCenter(), image.autoWindowWidth(), scaledSize);
+    QPainter painter(&thumbnail);
+    painter.drawImage(
+        QPoint((thumbnail.width() - scaled.width()) / 2, (thumbnail.height() - scaled.height()) / 2),
+        scaled);
+    painter.setPen(QColor(145, 156, 168));
+    painter.drawRect(thumbnail.rect().adjusted(0, 0, -1, -1));
+    return QIcon(thumbnail);
+}
+
+QString exportSuffix(const QString& formatId) {
+    if (formatId == QStringLiteral("tiraw")) {
+        return QStringLiteral("tiraw");
+    }
+    if (formatId == QStringLiteral("raw")) {
+        return QStringLiteral("raw");
+    }
+    if (formatId == QStringLiteral("jpeg")) {
+        return QStringLiteral("jpg");
+    }
+    if (formatId == QStringLiteral("tiff")) {
+        return QStringLiteral("tif");
+    }
+    return formatId;
+}
+
+QString exportFilter(const QString& formatId) {
+    if (formatId == QStringLiteral("tiraw")) {
+        return QStringLiteral("TiRayRaw (*.tiraw)");
+    }
+    if (formatId == QStringLiteral("raw")) {
+        return QStringLiteral("RAW 16-bit Little Endian (*.raw)");
+    }
+    if (formatId == QStringLiteral("png")) {
+        return QStringLiteral("PNG Image (*.png)");
+    }
+    if (formatId == QStringLiteral("tiff")) {
+        return QStringLiteral("TIFF Image (*.tif *.tiff)");
+    }
+    if (formatId == QStringLiteral("bmp")) {
+        return QStringLiteral("BMP Image (*.bmp)");
+    }
+    return QStringLiteral("JPEG Image (*.jpg *.jpeg)");
+}
+
+QByteArray imageWriterFormat(const QString& formatId) {
+    if (formatId == QStringLiteral("jpeg")) {
+        return QByteArrayLiteral("jpeg");
+    }
+    return formatId.toLatin1();
 }
 
 QPixmap drawAnalysisPreview(const QImage& image, const QRect& roi, const QSize& size) {
@@ -201,6 +279,7 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     : QMainWindow(parent) {
     imageSession_ = std::make_unique<ImageSession>(std::move(algorithms), this);
     replaySource_ = new LocalReplaySource(this);
+    replayDisplayCache_.setMaxCost(4);
     setWindowTitle(QStringLiteral("PA Host"));
     setMinimumSize(1180, 820);
     resize(initialWindowSize());
@@ -229,7 +308,7 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     splitter->setStretchFactor(1, 1);
     splitter->setStretchFactor(2, 0);
     splitter->setChildrenCollapsible(false);
-    splitter->setSizes({165, 960, 285});
+    splitter->setSizes({205, 920, 285});
     rootLayout->addWidget(splitter, 1);
 
     setCentralWidget(root);
@@ -254,59 +333,96 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     connect(replaySource_, &LocalReplaySource::runningChanged, this, [this](bool running) {
         if (!running) {
             const ImageSourceStats stats = replaySource_->stats();
-            appendLog(QStringLiteral("图像回放停止: 已显示 %1 帧，失败 %2 帧")
+            appendLog(QStringLiteral("图像回放停止: 输入 %1 帧，显示 %2 帧，显示丢帧 %3，加载失败 %4")
                           .arg(stats.deliveredFrames)
+                          .arg(replayDisplayedFrames_)
+                          .arg(replayDroppedDisplayFrames_)
                           .arg(stats.failedFrames));
         }
     });
     imageRefreshTimer_.setSingleShot(true);
-    imageRefreshTimer_.setInterval(35);
+    imageRefreshTimer_.setInterval(kStaticImageRefreshIntervalMs);
     connect(&imageRefreshTimer_, &QTimer::timeout, this, [this]() {
         refreshImage(resetViewStateOnRefresh_);
+        if (replaySource_->isRunning() && imagePresentationClock_.isValid()) {
+            const qint64 framePeriodNs = kNanosecondsPerSecond / std::max(1, replayTargetFps_);
+            const qint64 nowNs = imagePresentationClock_.nsecsElapsed();
+            do {
+                nextImagePresentationNs_ += framePeriodNs;
+            } while (nextImagePresentationNs_ <= nowNs);
+        }
         resetViewStateOnRefresh_ = false;
+        if (replayFramePending_) {
+            replayFramePending_ = false;
+            ++replayDisplayedFrames_;
+            ++replayFpsFrameCount_;
+            const qint64 elapsedMs = replayFpsTimer_.elapsed();
+            if (elapsedMs >= 500) {
+                const double fps = replayFpsFrameCount_ * 1000.0 / elapsedMs;
+                fpsLabel_->setText(QStringLiteral("显示 fps: %1 / 目标 %2")
+                                       .arg(fps, 0, 'f', 2)
+                                       .arg(replayTargetFps_));
+                replayFpsTimer_.restart();
+                replayFpsFrameCount_ = 0;
+            }
+        }
     });
+    imageInfoRefreshTimer_.setSingleShot(true);
+    connect(&imageInfoRefreshTimer_, &QTimer::timeout, this, &MainWindow::updateFullImageInfo);
 }
 
 void MainWindow::openImage() {
     stopImageReplay();
     const QString initialDirectory = defaultImageDirectory();
-    const QString path = QFileDialog::getOpenFileName(
+    const QStringList paths = QFileDialog::getOpenFileNames(
         this,
-        QStringLiteral("打开 TiRaw 图像"),
+        QStringLiteral("打开 TiRaw 图像（可多选）"),
         initialDirectory,
         QStringLiteral("TiRayRaw (*.tiraw);;All Files (*)"));
-    if (path.isEmpty()) {
+    if (paths.isEmpty()) {
         return;
     }
 
-    QString error;
-    if (!imageSession_->loadFile(path, &error)) {
-        QMessageBox::warning(this, QStringLiteral("打开失败"), error);
-        return;
+    QSettings().setValue(QStringLiteral("paths/lastImageDirectory"), QFileInfo(paths.first()).absolutePath());
+
+    TiRawImage lastImage;
+    QString lastPath;
+    QListWidgetItem* lastItem = nullptr;
+    QStringList failures;
+    const QSignalBlocker blockList(imageList_);
+    for (const QString& selectedPath : paths) {
+        const QString path = normalizedImagePath(selectedPath);
+        TiRawImage image;
+        QString error;
+        if (!image.load(path, &error)) {
+            failures.push_back(QStringLiteral("%1: %2").arg(QFileInfo(path).fileName(), error));
+            continue;
+        }
+
+        lastItem = addOrUpdateImageListItem(path, &image);
+        lastImage = std::move(image);
+        lastPath = path;
     }
 
-    QSettings().setValue(QStringLiteral("paths/lastImageDirectory"), QFileInfo(path).absolutePath());
+    if (lastItem != nullptr) {
+        ImageFrame frame;
+        frame.image = std::move(lastImage);
+        frame.sourceName = QFileInfo(lastPath).fileName();
+        frame.receivedAt = QDateTime::currentDateTimeUtc();
+        QString error;
+        if (imageSession_->setFrame(frame, &error)) {
+            imageList_->setCurrentItem(lastItem);
+            imageList_->scrollToItem(lastItem);
+            showCurrentSessionImage(lastPath, true);
+        }
+    }
 
-    imageList_->addItem(QFileInfo(path).fileName());
-    imageList_->setCurrentRow(imageList_->count() - 1);
-    const TiRawImage& image = imageSession_->image();
-    imageLabel_->setText(QStringLiteral("%1 x %2").arg(image.width()).arg(image.height()));
-    if (pixelInfoLabel_ != nullptr) {
-        pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
+    if (!failures.isEmpty()) {
+        QMessageBox::warning(
+            this,
+            QStringLiteral("部分图像打开失败"),
+            failures.join(QLatin1Char('\n')));
     }
-    if (roiInfoLabel_ != nullptr) {
-        updateFullImageInfo();
-    }
-    const WindowLevelResult autoWindow = imageSession_->autoWindowLevel();
-    appendLog(QStringLiteral("打开图像: %1, %2x%3, min=%4 max=%5, auto center=%6 width=%7")
-                  .arg(path)
-                  .arg(image.width())
-                  .arg(image.height())
-                  .arg(image.minValue())
-                  .arg(image.maxValue())
-                  .arg(autoWindow.center)
-                  .arg(autoWindow.width));
-    refreshImage(true);
 }
 
 void MainWindow::startImageReplay() {
@@ -326,27 +442,68 @@ void MainWindow::startImageReplay() {
         return;
     }
 
+    stopImageReplay();
     QSettings().setValue(QStringLiteral("paths/lastImageDirectory"), QFileInfo(paths.first()).absolutePath());
     replaySource_->setPlaylist(paths);
     replaySource_->setIntervalMs(std::max(1, 1000 / fps));
     replaySource_->setLoopEnabled(true);
-    imageList_->clear();
-    for (const QString& path : paths) {
-        imageList_->addItem(QFileInfo(path).fileName());
+    {
+        const QSignalBlocker blockList(imageList_);
+        imageList_->clear();
+        for (const QString& path : paths) {
+            addOrUpdateImageListItem(path);
+        }
     }
 
-    replayFpsTimer_.start();
+    clearReplayDisplayCaches();
+    replayFullImageStatsCache_.clear();
+    imagePresentationClock_.invalidate();
+    nextImagePresentationNs_ = 0;
+    replayTargetFps_ = fps;
+    imageInfoTimer_.invalidate();
     replayFpsFrameCount_ = 0;
-    fpsLabel_->setText(QStringLiteral("fps: 0.00"));
+    replayDisplayedFrames_ = 0;
+    replayDroppedDisplayFrames_ = 0;
+    replayFramePending_ = false;
+    fpsLabel_->setText(QStringLiteral("显示 fps: 0.00 / 目标 %1").arg(replayTargetFps_));
     QString error;
+    QElapsedTimer preloadTimer;
+    preloadTimer.start();
     if (!replaySource_->start(&error)) {
+        imageView_->setPixmapCacheEnabled(false);
         QMessageBox::warning(this, QStringLiteral("回放失败"), error);
         return;
     }
-    appendLog(QStringLiteral("开始图像回放: %1 个文件，目标 %2 fps").arg(paths.size()).arg(fps));
+    const qint64 preloadMs = preloadTimer.elapsed();
+    const ImageSourceStats sourceStats = replaySource_->stats();
+    const quint64 selectedFrames = static_cast<quint64>(paths.size());
+    const quint64 loadedFrames = selectedFrames > sourceStats.failedFrames
+        ? selectedFrames - sourceStats.failedFrames
+        : 0;
+    imageView_->setPixmapCacheEnabled(true);
+    imagePresentationClock_.start();
+    nextImagePresentationNs_ = 0;
+    replayFpsTimer_.start();
+    appendLog(QStringLiteral("开始图像回放: 预加载 %1/%2 帧，耗时 %3 ms，目标 %4 fps")
+                  .arg(loadedFrames)
+                  .arg(paths.size())
+                  .arg(preloadMs)
+                  .arg(fps));
 }
 
 void MainWindow::stopImageReplay() {
+    imageRefreshTimer_.stop();
+    imageInfoRefreshTimer_.stop();
+    if (replayFramePending_) {
+        ++replayDroppedDisplayFrames_;
+    }
+    replayFramePending_ = false;
+    resetViewStateOnRefresh_ = false;
+    imagePresentationClock_.invalidate();
+    nextImagePresentationNs_ = 0;
+    clearReplayDisplayCaches();
+    replayFullImageStatsCache_.clear();
+    imageView_->setPixmapCacheEnabled(false);
     if (replaySource_ != nullptr && replaySource_->isRunning()) {
         replaySource_->stop();
     }
@@ -423,6 +580,7 @@ void MainWindow::updateWindowLevel() {
         widthSpin_->setValue(widthSlider_->value());
     }
     if (!autoWindowCheck_->isChecked()) {
+        clearReplayDisplayCaches();
         scheduleImageRefresh(false);
     }
 }
@@ -495,13 +653,78 @@ QWidget* MainWindow::createTopBar() {
 QWidget* MainWindow::createImageListPanel() {
     auto* group = new QGroupBox(QStringLiteral("图像列表"), this);
     group->setObjectName(QStringLiteral("imageListPanel"));
-    group->setMinimumWidth(150);
-    group->setMaximumWidth(260);
+    group->setMinimumWidth(180);
+    group->setMaximumWidth(300);
     group->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
     auto* layout = new QVBoxLayout(group);
     imageList_ = new QListWidget(group);
+    imageList_->setObjectName(QStringLiteral("imageList"));
+    imageList_->setViewMode(QListView::IconMode);
+    imageList_->setFlow(QListView::TopToBottom);
+    imageList_->setWrapping(false);
+    imageList_->setMovement(QListView::Static);
+    imageList_->setResizeMode(QListView::Adjust);
+    imageList_->setIconSize(kThumbnailSize);
+    imageList_->setGridSize(kImageListItemSize);
+    imageList_->setTextElideMode(Qt::ElideMiddle);
+    imageList_->setWordWrap(false);
+    imageList_->setSpacing(3);
+    imageList_->setUniformItemSizes(true);
+    imageList_->setSelectionMode(QAbstractItemView::ExtendedSelection);
     imageList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    imageList_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(imageList_, &QListWidget::currentItemChanged, this, [this](QListWidgetItem* current) {
+        handleImageListSelection(current);
+    });
+
+    auto* removeButton = new QPushButton(QStringLiteral("移除选中图像"), group);
+    removeButton->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
+    removeButton->setToolTip(QStringLiteral("从列表移除选中图像，不删除源文件"));
+    connect(removeButton, &QPushButton::clicked, this, &MainWindow::removeSelectedImages);
+
+    auto* removeAction = new QAction(QStringLiteral("移除选中图像"), imageList_);
+    removeAction->setShortcut(QKeySequence::Delete);
+    removeAction->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    imageList_->addAction(removeAction);
+    connect(removeAction, &QAction::triggered, this, &MainWindow::removeSelectedImages);
+    connect(imageList_, &QListWidget::customContextMenuRequested, this, [this, removeAction](const QPoint& position) {
+        QListWidgetItem* clickedItem = imageList_->itemAt(position);
+        if (clickedItem == nullptr) {
+            return;
+        }
+        imageList_->setCurrentItem(clickedItem, QItemSelectionModel::ClearAndSelect);
+
+        QMenu menu(imageList_);
+        QMenu* exportMenu = menu.addMenu(QStringLiteral("导出当前图像"));
+        const struct {
+            const char* id;
+            const char* label;
+        } formats[] = {
+            {"tiraw", "TiRaw（原始数据）"},
+            {"raw", "RAW16 LE（无文件头）"},
+            {"png", "PNG（显示图像）"},
+            {"tiff", "TIFF（显示图像）"},
+            {"bmp", "BMP（显示图像）"},
+            {"jpeg", "JPEG（显示图像）"},
+        };
+        const QList<QByteArray> supportedFormats = QImageWriter::supportedImageFormats();
+        for (const auto& format : formats) {
+            const QString formatId = QString::fromLatin1(format.id);
+            QAction* action = exportMenu->addAction(QString::fromUtf8(format.label));
+            if (formatId != QStringLiteral("tiraw") && formatId != QStringLiteral("raw")) {
+                action->setEnabled(supportedFormats.contains(imageWriterFormat(formatId)));
+            }
+            connect(action, &QAction::triggered, this, [this, formatId]() {
+                exportCurrentImage(formatId);
+            });
+        }
+        menu.addSeparator();
+        menu.addAction(removeAction);
+        menu.exec(imageList_->viewport()->mapToGlobal(position));
+    });
+
     layout->addWidget(imageList_);
+    layout->addWidget(removeButton);
     return group;
 }
 
@@ -591,6 +814,7 @@ QWidget* MainWindow::createWindowLevelPanel() {
     widthSpin_->setValue(4096);
 
     connect(autoWindowCheck_, &QCheckBox::toggled, this, [this]() {
+        clearReplayDisplayCaches();
         scheduleImageRefresh(false);
     });
     connect(centerSlider_, &QSlider::valueChanged, this, &MainWindow::updateWindowLevel);
@@ -741,9 +965,206 @@ void MainWindow::appendLog(const QString& text) {
     }
 }
 
+QListWidgetItem* MainWindow::addOrUpdateImageListItem(const QString& path, const TiRawImage* image) {
+    const QString normalizedPath = normalizedImagePath(path);
+    QListWidgetItem* item = findImageListItem(normalizedPath);
+    if (item == nullptr) {
+        item = new QListWidgetItem(style()->standardIcon(QStyle::SP_FileIcon), QFileInfo(normalizedPath).fileName());
+        item->setData(kImagePathRole, normalizedPath);
+        item->setData(kThumbnailReadyRole, false);
+        item->setToolTip(normalizedPath);
+        item->setTextAlignment(Qt::AlignHCenter | Qt::AlignBottom);
+        item->setSizeHint(kImageListItemSize);
+        imageList_->addItem(item);
+    }
+    if (image != nullptr && image->isValid()) {
+        item->setIcon(makeImageThumbnail(*image));
+        item->setData(kThumbnailReadyRole, true);
+    }
+    return item;
+}
+
+QListWidgetItem* MainWindow::findImageListItem(const QString& path) const {
+    const QString normalizedPath = normalizedImagePath(path);
+    for (int row = 0; row < imageList_->count(); ++row) {
+        QListWidgetItem* item = imageList_->item(row);
+        if (item->data(kImagePathRole).toString() == normalizedPath) {
+            return item;
+        }
+    }
+    return nullptr;
+}
+
+void MainWindow::handleImageListSelection(QListWidgetItem* item) {
+    if (item == nullptr) {
+        return;
+    }
+
+    stopImageReplay();
+    const QString path = item->data(kImagePathRole).toString();
+    QString error;
+    if (!imageSession_->loadFile(path, &error)) {
+        QMessageBox::warning(this, QStringLiteral("打开失败"), error);
+        appendLog(QStringLiteral("切换图像失败: %1, %2").arg(path, error));
+        return;
+    }
+    if (!item->data(kThumbnailReadyRole).toBool()) {
+        item->setIcon(makeImageThumbnail(imageSession_->image()));
+        item->setData(kThumbnailReadyRole, true);
+    }
+    showCurrentSessionImage(path, true);
+}
+
+void MainWindow::removeSelectedImages() {
+    QList<QListWidgetItem*> selected = imageList_->selectedItems();
+    if (selected.isEmpty() && imageList_->currentItem() != nullptr) {
+        selected.push_back(imageList_->currentItem());
+    }
+    if (selected.isEmpty()) {
+        return;
+    }
+
+    stopImageReplay();
+    int nextRow = imageList_->currentRow();
+    {
+        const QSignalBlocker blockList(imageList_);
+        for (QListWidgetItem* item : selected) {
+            delete imageList_->takeItem(imageList_->row(item));
+        }
+        nextRow = std::min(nextRow, imageList_->count() - 1);
+        if (nextRow >= 0) {
+            imageList_->setCurrentRow(nextRow);
+        }
+    }
+
+    appendLog(QStringLiteral("从图像列表移除 %1 项（源文件未删除）").arg(selected.size()));
+    if (imageList_->count() == 0) {
+        clearCurrentImage();
+    } else {
+        handleImageListSelection(imageList_->currentItem());
+    }
+}
+
+void MainWindow::exportCurrentImage(const QString& formatId) {
+    QListWidgetItem* item = imageList_->currentItem();
+    if (item == nullptr) {
+        return;
+    }
+
+    const QString sourcePath = item->data(kImagePathRole).toString();
+    if (!imageSession_->hasImage() || normalizedImagePath(imageSession_->image().path()) != sourcePath) {
+        QString loadError;
+        if (!imageSession_->loadFile(sourcePath, &loadError)) {
+            QMessageBox::warning(this, QStringLiteral("导出失败"), loadError);
+            return;
+        }
+    }
+
+    QSettings settings;
+    QString exportDirectory = settings.value(QStringLiteral("paths/lastExportDirectory")).toString();
+    if (exportDirectory.isEmpty() || !QDir(exportDirectory).exists()) {
+        exportDirectory = QFileInfo(sourcePath).absolutePath();
+    }
+    const QString suffix = exportSuffix(formatId);
+    const QString defaultName = QFileInfo(sourcePath).completeBaseName()
+        + QStringLiteral("_export.") + suffix;
+    QString outputPath = QFileDialog::getSaveFileName(
+        this,
+        QStringLiteral("导出当前图像"),
+        QDir(exportDirectory).filePath(defaultName),
+        exportFilter(formatId));
+    if (outputPath.isEmpty()) {
+        return;
+    }
+    if (QFileInfo(outputPath).suffix().isEmpty()) {
+        outputPath += QLatin1Char('.') + suffix;
+    }
+
+    QString error;
+    bool exported = false;
+    if (formatId == QStringLiteral("tiraw")) {
+        exported = imageSession_->image().saveTiRaw(outputPath, &error);
+    } else if (formatId == QStringLiteral("raw")) {
+        exported = imageSession_->image().saveRaw16(outputPath, &error);
+    } else {
+        QImageWriter writer(outputPath, imageWriterFormat(formatId));
+        if (formatId == QStringLiteral("jpeg")) {
+            writer.setQuality(95);
+        }
+        exported = writer.write(imageSession_->render(centerSpin_->value(), widthSpin_->value()));
+        if (!exported) {
+            error = writer.errorString();
+        }
+    }
+
+    if (!exported) {
+        QMessageBox::warning(this, QStringLiteral("导出失败"), error);
+        return;
+    }
+    settings.setValue(QStringLiteral("paths/lastExportDirectory"), QFileInfo(outputPath).absolutePath());
+    appendLog(QStringLiteral("导出图像: %1 -> %2").arg(sourcePath, outputPath));
+}
+
+void MainWindow::showCurrentSessionImage(const QString& source, bool resetViewState) {
+    if (!imageSession_->hasImage()) {
+        return;
+    }
+
+    const TiRawImage& image = imageSession_->image();
+    clearReplayDisplayCaches();
+    imageLabel_->setText(QStringLiteral("%1 x %2").arg(image.width()).arg(image.height()));
+    fpsLabel_->setText(QStringLiteral("fps: 0.00"));
+    pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
+    updateFullImageInfo();
+    const WindowLevelResult autoWindow = imageSession_->autoWindowLevel();
+    appendLog(QStringLiteral("打开图像: %1, %2x%3, min=%4 max=%5, auto center=%6 width=%7")
+                  .arg(source)
+                  .arg(image.width())
+                  .arg(image.height())
+                  .arg(image.minValue())
+                  .arg(image.maxValue())
+                  .arg(autoWindow.center)
+                  .arg(autoWindow.width));
+    refreshImage(resetViewState);
+}
+
+void MainWindow::clearCurrentImage() {
+    imageRefreshTimer_.stop();
+    imageInfoRefreshTimer_.stop();
+    imageSession_->clear();
+    imageView_->setImage(QImage());
+    imageLabel_->setText(QStringLiteral("当前图像: --"));
+    progressLabel_->setText(QStringLiteral("缩放: --"));
+    fpsLabel_->setText(QStringLiteral("fps: 0.00"));
+    pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
+    roiInfoLabel_->setText(QStringLiteral("ROI 信息: --"));
+}
+
+void MainWindow::clearReplayDisplayCaches() {
+    replayDisplayCache_.clear();
+    if (imageView_ != nullptr) {
+        imageView_->clearPixmapCache();
+    }
+}
+
 void MainWindow::scheduleImageRefresh(bool resetViewState) {
     resetViewStateOnRefresh_ = resetViewStateOnRefresh_ || resetViewState;
-    imageRefreshTimer_.start();
+    if (!imageRefreshTimer_.isActive()) {
+        int delayMs = kStaticImageRefreshIntervalMs;
+        if (replaySource_->isRunning()) {
+            if (!imagePresentationClock_.isValid()) {
+                delayMs = 0;
+            } else {
+                const qint64 remainingNs = nextImagePresentationNs_
+                    - imagePresentationClock_.nsecsElapsed();
+                delayMs = remainingNs <= 0
+                    ? 0
+                    : static_cast<int>((remainingNs + kNanosecondsPerMillisecond - 1)
+                        / kNanosecondsPerMillisecond);
+            }
+        }
+        imageRefreshTimer_.start(delayMs);
+    }
 }
 
 void MainWindow::refreshImage(bool resetViewState) {
@@ -767,7 +1188,19 @@ void MainWindow::refreshImage(bool resetViewState) {
         widthSpin_->setValue(autoWindow.width);
     }
 
-    const QImage display = imageSession_->render(centerSpin_->value(), widthSpin_->value());
+    QImage display;
+    if (replaySource_->isRunning()) {
+        const QString cacheKey = imageSession_->image().path()
+            + QStringLiteral("\n%1\n%2").arg(centerSpin_->value()).arg(widthSpin_->value());
+        if (const QImage* cached = replayDisplayCache_.object(cacheKey)) {
+            display = *cached;
+        } else {
+            display = imageSession_->render(centerSpin_->value(), widthSpin_->value());
+            replayDisplayCache_.insert(cacheKey, new QImage(display));
+        }
+    } else {
+        display = imageSession_->render(centerSpin_->value(), widthSpin_->value());
+    }
     imageView_->setImage(display, resetViewState);
 }
 
@@ -788,14 +1221,8 @@ void MainWindow::updatePixelInfo(const QPoint& imagePoint) {
                                  .arg(value));
 }
 
-void MainWindow::updateRoiInfo(const QRect& imageRect) {
+void MainWindow::showRoiInfo(const TiRawImage::RoiStats& stats) {
     if (roiInfoLabel_ == nullptr) {
-        return;
-    }
-
-    TiRawImage::RoiStats stats;
-    if (!imageSession_->roiStats(imageRect, &stats)) {
-        roiInfoLabel_->setText(QStringLiteral("ROI 信息: --"));
         return;
     }
 
@@ -822,6 +1249,17 @@ void MainWindow::updateRoiInfo(const QRect& imageRect) {
                                .arg(QString::number(stats.rowNoise, 'f', 4)));
 }
 
+void MainWindow::updateRoiInfo(const QRect& imageRect) {
+    TiRawImage::RoiStats stats;
+    if (!imageSession_->roiStats(imageRect, &stats)) {
+        if (roiInfoLabel_ != nullptr) {
+            roiInfoLabel_->setText(QStringLiteral("ROI 信息: --"));
+        }
+        return;
+    }
+    showRoiInfo(stats);
+}
+
 void MainWindow::updateFullImageInfo() {
     if (!imageSession_->hasImage()) {
         if (roiInfoLabel_ != nullptr) {
@@ -831,6 +1269,19 @@ void MainWindow::updateFullImageInfo() {
     }
 
     const TiRawImage& image = imageSession_->image();
+    if (replaySource_->isRunning()) {
+        const QString cacheKey = image.path();
+        auto cached = replayFullImageStatsCache_.constFind(cacheKey);
+        if (cached == replayFullImageStatsCache_.constEnd()) {
+            TiRawImage::RoiStats stats;
+            if (!imageSession_->roiStats(QRect(0, 0, image.width(), image.height()), &stats)) {
+                return;
+            }
+            cached = replayFullImageStatsCache_.insert(cacheKey, stats);
+        }
+        showRoiInfo(cached.value());
+        return;
+    }
     updateRoiInfo(QRect(0, 0, image.width(), image.height()));
 }
 
@@ -937,6 +1388,7 @@ void MainWindow::applyWindowLevelFromRoi(const QRect& imageRect) {
         widthSpin_->setValue(windowLevel.width);
     }
 
+    clearReplayDisplayCaches();
     refreshImage(false);
 }
 
@@ -950,21 +1402,27 @@ void MainWindow::handleImageFrame(const ImageFrame& frame) {
         return;
     }
 
+    if (replayFramePending_) {
+        ++replayDroppedDisplayFrames_;
+    }
+    replayFramePending_ = true;
+
     imageLabel_->setText(QStringLiteral("%1 x %2").arg(frame.image.width()).arg(frame.image.height()));
-    imageList_->setCurrentRow(static_cast<int>(frame.sequence % static_cast<quint64>(std::max(1, imageList_->count()))));
-    if (!imageInfoTimer_.isValid() || imageInfoTimer_.elapsed() >= 1000) {
-        updateFullImageInfo();
-        imageInfoTimer_.restart();
+    QListWidgetItem* item = findImageListItem(frame.image.path());
+    if (item != nullptr) {
+        if (!item->data(kThumbnailReadyRole).toBool()) {
+            item->setIcon(makeImageThumbnail(frame.image));
+            item->setData(kThumbnailReadyRole, true);
+        }
+        const QSignalBlocker blockList(imageList_);
+        imageList_->setCurrentItem(item);
+        imageList_->scrollToItem(item);
     }
     scheduleImageRefresh(resetViewState);
-
-    ++replayFpsFrameCount_;
-    const qint64 elapsedMs = replayFpsTimer_.elapsed();
-    if (elapsedMs >= 500) {
-        const double fps = replayFpsFrameCount_ * 1000.0 / elapsedMs;
-        fpsLabel_->setText(QStringLiteral("fps: %1").arg(fps, 0, 'f', 2));
-        replayFpsTimer_.restart();
-        replayFpsFrameCount_ = 0;
+    if ((!imageInfoTimer_.isValid() || imageInfoTimer_.elapsed() >= 1000)
+        && !imageInfoRefreshTimer_.isActive()) {
+        imageInfoTimer_.restart();
+        imageInfoRefreshTimer_.start(1);
     }
 }
 

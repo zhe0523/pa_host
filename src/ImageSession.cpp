@@ -38,6 +38,11 @@ bool ImageSession::setFrame(const ImageFrame& frame, QString* errorMessage) {
     return true;
 }
 
+void ImageSession::clear() {
+    currentFrame_ = {};
+    emit frameChanged(currentFrame_);
+}
+
 bool ImageSession::hasImage() const {
     return currentFrame_.image.isValid();
 }

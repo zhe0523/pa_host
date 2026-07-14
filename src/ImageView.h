@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QCache>
 #include <QGraphicsPixmapItem>
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
@@ -21,6 +22,8 @@ public:
     explicit ImageView(QWidget* parent = nullptr);
 
     void setImage(const QImage& image, bool resetViewState = false);
+    void setPixmapCacheEnabled(bool enabled);
+    void clearPixmapCache();
     bool hasImage() const;
     int zoomPercent() const;
 
@@ -65,12 +68,14 @@ private:
     QGraphicsScene scene_;
     QGraphicsPixmapItem* pixmapItem_ = nullptr;
     QGraphicsRectItem* roiItem_ = nullptr;
+    QCache<qint64, QPixmap> pixmapCache_;
     QImage image_;
     qreal zoom_ = 1.0;
     int rotation_ = 0;
     bool flipH_ = false;
     bool flipV_ = false;
     bool fitMode_ = true;
+    bool pixmapCacheEnabled_ = false;
     SelectionMode selectionMode_ = SelectionMode::None;
     QPoint roiStart_;
 };

@@ -22,6 +22,7 @@ public:
 
     bool loadFile(const QString& path, QString* errorMessage);
     bool setFrame(const ImageFrame& frame, QString* errorMessage);
+    void clear();
     bool hasImage() const;
     const TiRawImage& image() const;
     ImageFrame currentFrame() const;

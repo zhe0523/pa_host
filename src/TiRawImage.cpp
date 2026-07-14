@@ -1,8 +1,10 @@
 #include "TiRawImage.h"
 
 #include <QFile>
+#include <QSaveFile>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -11,6 +13,11 @@ namespace {
 constexpr int kHeaderSize = 16;
 constexpr char kMagic[] = "TiRayRaw";
 constexpr double kAutoWindowTailPercent = 0.006;
+
+void appendLe16(QByteArray* data, quint16 value) {
+    data->append(static_cast<char>(value & 0xff));
+    data->append(static_cast<char>((value >> 8) & 0xff));
+}
 }
 
 bool TiRawImage::load(const QString& path, QString* errorMessage) {
@@ -77,6 +84,74 @@ bool TiRawImage::loadData(const QByteArray& data, const QString& sourceName, QSt
     pixels_ = std::move(pixels);
     updateRange();
 
+    return true;
+}
+
+bool TiRawImage::saveTiRaw(const QString& path, QString* errorMessage) const {
+    return savePixelData(path, true, errorMessage);
+}
+
+bool TiRawImage::saveRaw16(const QString& path, QString* errorMessage) const {
+    return savePixelData(path, false, errorMessage);
+}
+
+bool TiRawImage::savePixelData(const QString& path, bool includeHeader, QString* errorMessage) const {
+    if (!isValid()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("当前没有可导出的原始图像");
+        }
+        return false;
+    }
+
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = file.errorString();
+        }
+        return false;
+    }
+
+    if (includeHeader) {
+        QByteArray header(kMagic, 8);
+        appendLe16(&header, version_);
+        appendLe16(&header, bytesPerPixel_);
+        appendLe16(&header, static_cast<quint16>(height_));
+        appendLe16(&header, static_cast<quint16>(width_));
+        if (file.write(header) != header.size()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = file.errorString();
+            }
+            file.cancelWriting();
+            return false;
+        }
+    }
+
+    constexpr int kPixelsPerChunk = 512 * 1024;
+    QByteArray chunk;
+    const quint16* pixelData = pixels_.constData();
+    for (int offset = 0; offset < pixels_.size(); offset += kPixelsPerChunk) {
+        const int count = std::min(kPixelsPerChunk, pixels_.size() - offset);
+        chunk.resize(count * 2);
+        for (int index = 0; index < count; ++index) {
+            const quint16 value = pixelData[offset + index];
+            chunk[index * 2] = static_cast<char>(value & 0xff);
+            chunk[index * 2 + 1] = static_cast<char>((value >> 8) & 0xff);
+        }
+        if (file.write(chunk) != chunk.size()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = file.errorString();
+            }
+            file.cancelWriting();
+            return false;
+        }
+    }
+
+    if (!file.commit()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = file.errorString();
+        }
+        return false;
+    }
     return true;
 }
 
@@ -160,11 +235,12 @@ bool TiRawImage::roiStats(const QRect& rect, RoiStats* stats) const {
     QVector<double> rowMeans;
     rowMeans.reserve(roi.height());
 
+    const quint16* pixelData = pixels_.constData();
     for (int y = roi.top(); y <= roi.bottom(); ++y) {
         double rowSum = 0.0;
-        const int row = y * width_;
+        const quint16* row = pixelData + y * width_;
         for (int x = roi.left(); x <= roi.right(); ++x) {
-            const quint16 value = pixels_.at(row + x);
+            const quint16 value = row[x];
             result.min = std::min(result.min, value);
             result.max = std::max(result.max, value);
             sum += value;
@@ -207,7 +283,15 @@ bool TiRawImage::roiStats(const QRect& rect, RoiStats* stats) const {
 }
 
 QImage TiRawImage::toDisplayImage(bool autoWindow, int windowCenter, int windowWidth) const {
-    if (!isValid()) {
+    return toDisplayImage(autoWindow, windowCenter, windowWidth, QSize(width_, height_));
+}
+
+QImage TiRawImage::toDisplayImage(
+    bool autoWindow,
+    int windowCenter,
+    int windowWidth,
+    const QSize& outputSize) const {
+    if (!isValid() || outputSize.isEmpty()) {
         return {};
     }
 
@@ -227,14 +311,47 @@ QImage TiRawImage::toDisplayImage(bool autoWindow, int windowCenter, int windowW
         high = low + 1;
     }
 
-    QImage image(width_, height_, QImage::Format_Grayscale8);
-    for (int y = 0; y < height_; ++y) {
+    std::array<uchar, 65536> lookup{};
+    for (int value = 0; value < 65536; ++value) {
+        if (value <= low) {
+            lookup[static_cast<std::size_t>(value)] = 0;
+        } else if (value >= high) {
+            lookup[static_cast<std::size_t>(value)] = 255;
+        } else {
+            lookup[static_cast<std::size_t>(value)] = static_cast<uchar>((value - low) * 255 / (high - low));
+        }
+    }
+
+    QImage image(outputSize, QImage::Format_Grayscale8);
+    if (image.isNull()) {
+        return {};
+    }
+    const quint16* source = pixels_.constData();
+    if (outputSize == QSize(width_, height_)) {
+        for (int y = 0; y < height_; ++y) {
+            uchar* dst = image.scanLine(y);
+            const quint16* row = source + y * width_;
+            for (int x = 0; x < width_; ++x) {
+                dst[x] = lookup[row[x]];
+            }
+        }
+        return image;
+    }
+
+    QVector<int> sourceColumns(outputSize.width());
+    for (int x = 0; x < outputSize.width(); ++x) {
+        sourceColumns[x] = std::min(
+            width_ - 1,
+            static_cast<int>((static_cast<qint64>(x) * 2 + 1) * width_ / (outputSize.width() * 2LL)));
+    }
+    for (int y = 0; y < outputSize.height(); ++y) {
         uchar* dst = image.scanLine(y);
-        const int row = y * width_;
-        for (int x = 0; x < width_; ++x) {
-            const int value = pixels_.at(row + x);
-            const int clipped = std::max(low, std::min(high, value));
-            dst[x] = static_cast<uchar>((clipped - low) * 255 / (high - low));
+        const int sourceRow = std::min(
+            height_ - 1,
+            static_cast<int>((static_cast<qint64>(y) * 2 + 1) * height_ / (outputSize.height() * 2LL)));
+        const quint16* row = source + sourceRow * width_;
+        for (int x = 0; x < outputSize.width(); ++x) {
+            dst[x] = lookup[row[sourceColumns.at(x)]];
         }
     }
 

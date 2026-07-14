@@ -28,6 +28,7 @@ doc/kylin-handover.md 给 Kylin 机器继续开发时看的交接文档
 doc/architecture.md   模块边界、算法替换和 PCIe 图像链路设计
 doc/git-commit-note-20260710.md 图像交互阶段的中文提交说明
 doc/git-commit-note-20260714.md 架构解耦与图像回放阶段的中文提交说明
+doc/git-commit-note-20260714-image-list-replay-performance.md 图像列表、导出与回放性能阶段的中文提交说明
 ```
 
 ## 构建
@@ -40,6 +41,8 @@ cmake -S . -B build
 cmake --build build -j
 ./build/pa_host
 ```
+
+在 Makefiles/Ninja 这类单配置生成器下，如果没有显式指定，工程默认使用 `RelWithDebInfo`，即启用优化并保留调试符号。图像加载、窗宽窗位转换和 ROI 扫描不应使用空的 `CMAKE_BUILD_TYPE` 或未优化构建做性能判断。需要完整调试构建时显式使用 `-DCMAKE_BUILD_TYPE=Debug`。
 
 当前工程使用 CMake 构建，`qmake` 不是必须项。Kylin 上如果 `pkg-config --modversion Qt5Core Qt5Widgets Qt5SerialPort`
 能看到版本号，可以先直接尝试 CMake 构建。Qt Creator 可以直接打开 `CMakeLists.txt`，但会默认使用自己的
@@ -98,10 +101,11 @@ PA/ARM 命令字符串和 OK/ERR 响应解析
 0.6% ~ 99.4% 自动窗宽窗位
 ROI 均值、最小/最大、标准差和行噪声
 手动窗宽窗位的 8-bit 显示映射
+缩略图尺寸下的直接降采样显示映射
 图像算法接口的自动/ROI 窗宽窗位契约
 内存字节流解析为 TiRawImage
 ImageSession 文件加载、当前帧、ROI 和显示渲染
-LocalReplaySource 帧序号、停止状态、坏文件跳过和统计
+LocalReplaySource 帧序号、停止状态、快速重启、坏文件跳过和统计
 ESF / LSF / MTF 基础分析与 CSV 导出
 ```
 
@@ -114,9 +118,16 @@ pa_core       图像数据、协议解析、算法接口和默认算法
 pa_transport  RS422 串口收发
 pa_host       Qt 界面和模块组装
 pa_host_tests 无界面核心测试
+pa_image_benchmark 真实 TiRaw 性能基准工具
 ```
 
 `MainWindow` 不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
+
+构建时启用 `BUILD_TESTING` 后，可以用真实的 2～3 帧序列复测预加载、显示转换、缩略图和全图统计耗时：
+
+```sh
+./build/pa_image_benchmark frame1.tiraw frame2.tiraw frame3.tiraw
+```
 
 ## 当前界面能力
 
@@ -125,7 +136,7 @@ pa_host_tests 无界面核心测试
 ```text
 顶部菜单：文件 / RS422 / PA/FPGA / 视图 / 校准 / 工具 / 帮助
 顶部模式条：Idle / Continuous / 手动上图 / 停止上图
-左侧：图像列表
+左侧：带缩略图的图像列表，可点击切换和移除
 中间：图像画布
 右侧：图像操作 / 窗宽窗位 / 图像信息
 底部：型号 / 串口 / 连接状态 / 工作模式 / 图像尺寸 / 缩放
@@ -145,12 +156,29 @@ Shift+左键拖框：按 ROI 重新计算窗位/窗宽
 图像输入：
 
 ```text
-文件 -> 打开 TiRaw 图像：加载单张本地图像
+文件 -> 打开 TiRaw 图像：可一次选择一张或多张本地图像
 文件 -> 回放 TiRaw 序列：选择多张图像、设置 1~120 fps 后循环回放
 文件 -> 停止图像回放：停止本地回放
 ```
 
-回放使用和未来 PCIe 相同的 `IImageSource -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际回放 FPS。PCIe 尚未接入。
+回放使用和未来 PCIe 相同的 `IImageSource -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际显示 FPS。PCIe 尚未接入。
+
+普通图像列表只保存文件路径和缩略图，不常驻缓存所有 16-bit 原始图像。点击列表项时重新加载对应文件；选中一项或多项后，可点击“移除选中图像”、按 Delete，或使用右键菜单移除。移除只影响列表，不会删除磁盘上的源文件。
+
+本地回放针对当前固定的 2～3 帧使用预加载：开始回放时读取并解析一次原始图像，循环时复用内存帧；日志会记录成功预加载帧数和耗时。主窗口最多缓存 4 张当前窗宽窗位下的 8-bit 显示图，`ImageView` 还会在 128 MiB 上限内缓存对应 `QPixmap`，避免无显卡或远程桌面环境反复做显示格式转换。首帧立即提交，后续显示节拍跟随用户设置的 1～120 fps；累计时间基准会自动补偿整数毫秒定时误差。处理速度跟不上输入时只保留最新帧并统计显示丢帧，不累积延迟。状态栏同时显示实际显示 fps 和目标 fps。全图 ROI 统计延迟到首帧提交后执行，并按固定回放帧缓存。调整窗宽窗位、停止或重新开始回放会自动清空相关缓存。
+
+图像列表缩略图直接从 16-bit 原始像素降采样到目标尺寸，不再先生成一张完整的 8-bit 大图，因此打开多张大图或首次回放时的界面阻塞更小。
+
+右键点击图像列表项可从“导出当前图像”子菜单选择格式：
+
+```text
+TiRaw       保留 TiRayRaw 文件头和原始 16-bit little-endian 像素
+RAW16 LE    仅导出原始 16-bit little-endian 像素，不包含宽高和文件头
+PNG / TIFF  导出当前窗宽窗位映射后的 8-bit 显示图像
+BMP / JPEG  导出当前窗宽窗位映射后的 8-bit 显示图像
+```
+
+DCM 暂未实现。DICOM 需要明确设备、检查和图像元数据以及编码规范，不能只修改文件扩展名。
 
 ## 与 ARM 的当前协议
 
@@ -237,6 +265,8 @@ Ctrl+ROI 分析测试弹窗
 Shift+ROI 按区域重算窗位窗宽
 图像算法接口与默认实现解耦
 本地 TiRaw 序列连续回放
+多图打开、缩略图列表、点击切换和批量移除
+图像列表右键导出 TiRaw、RAW16、PNG、TIFF、BMP 和 JPEG
 连续帧实际 FPS、错误和完成统计
 相同尺寸连续帧保持当前图像视图状态
 ESF / LSF / MTF 曲线 CSV 导出

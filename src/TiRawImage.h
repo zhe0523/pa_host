@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QImage>
 #include <QRect>
+#include <QSize>
 #include <QString>
 #include <QVector>
 #include <QtGlobal>
@@ -37,6 +38,8 @@ public:
 
     bool load(const QString& path, QString* errorMessage);
     bool loadData(const QByteArray& data, const QString& sourceName, QString* errorMessage);
+    bool saveTiRaw(const QString& path, QString* errorMessage) const;
+    bool saveRaw16(const QString& path, QString* errorMessage) const;
     bool isValid() const;
 
     QString path() const;
@@ -54,8 +57,14 @@ public:
     bool roiStats(const QRect& rect, RoiStats* stats) const;
 
     QImage toDisplayImage(bool autoWindow, int windowCenter, int windowWidth) const;
+    QImage toDisplayImage(
+        bool autoWindow,
+        int windowCenter,
+        int windowWidth,
+        const QSize& outputSize) const;
 
 private:
+    bool savePixelData(const QString& path, bool includeHeader, QString* errorMessage) const;
     static quint16 readLe16(const uchar* p);
     void updateRange();
     void updateAutoWindowLevel();

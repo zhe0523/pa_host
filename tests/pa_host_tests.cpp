@@ -144,6 +144,9 @@ bool testTirawParsingAndRoi() {
     CHECK(display.height() == 3);
     CHECK(display.constScanLine(0)[0] == 0);
     CHECK(display.constScanLine(2)[3] == 255);
+    const QImage thumbnail = image.toDisplayImage(false, 65, 110, QSize(2, 2));
+    CHECK(thumbnail.size() == QSize(2, 2));
+    CHECK(thumbnail.constScanLine(1)[1] == 255);
 
     QFile file(path);
     CHECK(file.open(QIODevice::ReadOnly));
@@ -153,6 +156,17 @@ bool testTirawParsingAndRoi() {
     CHECK(memoryImage.width() == 4);
     CHECK(memoryImage.height() == 3);
     CHECK(memoryImage.pixelValue(2, 1, &value));
+    CHECK(value == 70);
+
+    const QString exportedTirawPath = directory.filePath(QStringLiteral("exported.tiraw"));
+    const QString exportedRawPath = directory.filePath(QStringLiteral("exported.raw"));
+    CHECK(image.saveTiRaw(exportedTirawPath, &error));
+    CHECK(image.saveRaw16(exportedRawPath, &error));
+    CHECK(QFileInfo(exportedTirawPath).size() == 16 + pixels.size() * 2);
+    CHECK(QFileInfo(exportedRawPath).size() == pixels.size() * 2);
+    TiRawImage exportedImage;
+    CHECK(exportedImage.load(exportedTirawPath, &error));
+    CHECK(exportedImage.pixelValue(2, 1, &value));
     CHECK(value == 70);
     return true;
 }
@@ -237,6 +251,8 @@ bool testImageSession() {
     TiRawImage::RoiStats stats;
     CHECK(session.roiStats(QRect(0, 0, 2, 2), &stats));
     CHECK(stats.max == 40);
+    session.clear();
+    CHECK(!session.hasImage());
     return true;
 }
 
@@ -253,11 +269,13 @@ bool testLocalReplaySource() {
     source.setIntervalMs(1);
     source.setLoopEnabled(false);
     QVector<ImageFrame> frames;
+    bool runningWhileDelivering = true;
     QEventLoop loop;
     QTimer timeout;
     timeout.setSingleShot(true);
     QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
-    QObject::connect(&source, &LocalReplaySource::frameReady, &loop, [&frames](const ImageFrame& frame) {
+    QObject::connect(&source, &LocalReplaySource::frameReady, &loop, [&frames, &source, &runningWhileDelivering](const ImageFrame& frame) {
+        runningWhileDelivering = runningWhileDelivering && source.isRunning();
         frames.push_back(frame);
     });
     QObject::connect(&source, &LocalReplaySource::runningChanged, &loop, [&loop](bool running) {
@@ -268,12 +286,14 @@ bool testLocalReplaySource() {
 
     QString error;
     CHECK(source.start(&error));
+    CHECK(QFile::remove(second));
     timeout.start(1000);
     loop.exec();
     CHECK(frames.size() == 2);
     CHECK(frames.at(0).sequence == 0);
     CHECK(frames.at(1).sequence == 1);
     CHECK(frames.at(0).image.minValue() == 1);
+    CHECK(runningWhileDelivering);
     CHECK(!source.isRunning());
     CHECK(source.stats().deliveredFrames == 2);
     CHECK(source.stats().failedFrames == 0);
@@ -300,6 +320,23 @@ bool testLocalReplaySource() {
     invalidLoop.exec();
     CHECK(validFrames == 1);
     CHECK(invalidSource.stats().failedFrames == 1);
+
+    LocalReplaySource restartedSource;
+    restartedSource.setPlaylist({first});
+    restartedSource.setIntervalMs(1000);
+    restartedSource.setLoopEnabled(true);
+    int restartedFrames = 0;
+    QObject::connect(&restartedSource, &LocalReplaySource::frameReady, [&restartedFrames](const ImageFrame&) {
+        ++restartedFrames;
+    });
+    CHECK(restartedSource.start(&error));
+    restartedSource.stop();
+    CHECK(restartedSource.start(&error));
+    QEventLoop restartLoop;
+    QTimer::singleShot(20, &restartLoop, &QEventLoop::quit);
+    restartLoop.exec();
+    restartedSource.stop();
+    CHECK(restartedFrames == 1);
     return true;
 }
 

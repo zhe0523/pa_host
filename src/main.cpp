@@ -137,6 +137,18 @@ QListWidget::item:selected {
     color: #123b6d;
 }
 
+QListWidget#imageList::item {
+    padding: 4px;
+    border: 2px solid transparent;
+    border-radius: 3px;
+}
+
+QListWidget#imageList::item:selected {
+    background: #f2fff5;
+    border-color: #2f9e44;
+    color: #163d22;
+}
+
 QSlider::groove:horizontal {
     height: 4px;
     background: #d8e0ea;

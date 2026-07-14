@@ -1,7 +1,10 @@
 #pragma once
 
+#include <QCache>
 #include <QLabel>
 #include <QElapsedTimer>
+#include <QImage>
+#include <QHash>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QPlainTextEdit>
@@ -22,6 +25,7 @@
 
 class QCheckBox;
 class QComboBox;
+class QListWidgetItem;
 class QSlider;
 class QAction;
 
@@ -62,9 +66,18 @@ private:
     void createMenus();
     void createStatusBar();
     void appendLog(const QString& text);
+    QListWidgetItem* addOrUpdateImageListItem(const QString& path, const TiRawImage* image = nullptr);
+    QListWidgetItem* findImageListItem(const QString& path) const;
+    void handleImageListSelection(QListWidgetItem* item);
+    void removeSelectedImages();
+    void exportCurrentImage(const QString& formatId);
+    void showCurrentSessionImage(const QString& source, bool resetViewState);
+    void clearCurrentImage();
+    void clearReplayDisplayCaches();
     void scheduleImageRefresh(bool resetViewState = false);
     void refreshImage(bool resetViewState = false);
     void updatePixelInfo(const QPoint& imagePoint);
+    void showRoiInfo(const TiRawImage::RoiStats& stats);
     void updateRoiInfo(const QRect& imageRect);
     void updateFullImageInfo();
     void handleAnalysisRoi(const QRect& imageRect);
@@ -104,9 +117,18 @@ private:
     QLabel* roiInfoLabel_ = nullptr;
 
     QTimer imageRefreshTimer_;
+    QTimer imageInfoRefreshTimer_;
+    QCache<QString, QImage> replayDisplayCache_;
+    QHash<QString, TiRawImage::RoiStats> replayFullImageStatsCache_;
+    QElapsedTimer imagePresentationClock_;
     QElapsedTimer replayFpsTimer_;
     QElapsedTimer imageInfoTimer_;
+    qint64 nextImagePresentationNs_ = 0;
     quint64 replayFpsFrameCount_ = 0;
+    quint64 replayDisplayedFrames_ = 0;
+    quint64 replayDroppedDisplayFrames_ = 0;
+    int replayTargetFps_ = 30;
+    bool replayFramePending_ = false;
     bool resetViewStateOnRefresh_ = false;
     bool imageMaximized_ = false;
 };
