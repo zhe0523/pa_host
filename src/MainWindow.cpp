@@ -296,8 +296,6 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
         this, &MainWindow::updateDeviceState);
     connect(deviceController_, &PaDeviceController::deviceStatusChanged,
         this, &MainWindow::updateDeviceStatus);
-    connect(deviceController_, &PaDeviceController::interruptReceived,
-        this, &MainWindow::updateInterruptCount);
     connect(deviceController_, &PaDeviceController::lineTransmitted, this, [this](const QString& line) {
         logService_->info(QStringLiteral("RS422"), QStringLiteral("TX: %1").arg(line));
     });
@@ -882,7 +880,6 @@ void MainWindow::createMenus() {
         {PaProtocol::Command::MakeGain, "生成 Gain"},
         {PaProtocol::Command::StartCorrection, "启动校正"},
         {PaProtocol::Command::SendImage, "手动上图"},
-        {PaProtocol::Command::WaitIrq, "等待中断"},
         {PaProtocol::Command::Quit, "退出 ARM"},
     };
     for (const MenuCommand& item : commands) {
@@ -1356,8 +1353,4 @@ void MainWindow::updateDeviceStatus(const PaDeviceStatus& status) {
                             .arg(status.writeEnd)
                             .arg(status.correctionState)
                             .arg(status.correctionEnd));
-}
-
-void MainWindow::updateInterruptCount(quint64 count) {
-    modeLabel_->setText(QStringLiteral("IRQ count=%1").arg(count));
 }

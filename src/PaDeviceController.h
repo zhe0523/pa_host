@@ -18,7 +18,6 @@ enum class PaDeviceState {
 
 struct PaDeviceStatus {
     bool valid = false;
-    quint32 interruptFlags = 0;
     quint32 paFlags = 0;
     quint32 communicationFlags = 0;
     quint32 resetFlags = 0;
@@ -52,7 +51,6 @@ public:
 signals:
     void stateChanged(PaDeviceState state);
     void deviceStatusChanged(const PaDeviceStatus& status);
-    void interruptReceived(quint64 count);
     void commandFinished(PaProtocol::Command command, bool success, const QString& detail);
     void lineTransmitted(const QString& line);
     void lineReceived(const QString& line);

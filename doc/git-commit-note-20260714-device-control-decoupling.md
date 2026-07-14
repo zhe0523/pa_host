@@ -1,5 +1,9 @@
 # 2026-07-14 设备控制链路解耦提交说明
 
+> 后续更正：早期实现把未确认的硬件中断概念引入了 RS422 业务协议，产生了
+> `WAIT_IRQ`、`OK IRQ count=...` 和 `STATUS int=...`。这些内容已在后续修改中删除。
+> FPGA 的 MSI/MSI-X 中断只属于 PCIe 驱动内部，ARM 主动通知必须使用有业务语义的事件。
+
 ## 提交主题
 
 ```text
@@ -46,7 +50,7 @@ Linux/Windows 串口打开和关闭
 转发 QSerialPort 错误
 ```
 
-串口类不解释 `OK`、`ERR`、`STATUS` 或 `IRQ` 的业务含义。
+串口类不解释 `OK`、`ERR` 或 `STATUS` 的业务含义。
 
 ### 3. 新增 PaDeviceController
 
@@ -84,8 +88,7 @@ Error         响应失败、超时或传输错误
 ```
 
 默认响应超时为 5000 ms，可通过 `setCommandTimeoutMs()` 调整。该值表示命令确认响应
-超时，不代表 Offset、Gain 或校正算法的完整执行时间。`WAIT_IRQ` 的正式等待策略需要
-ARM 实机联调后再确认。
+超时，不代表 Offset、Gain 或校正算法的完整执行时间。
 
 ### 5. 防止迟到响应串线
 
@@ -94,10 +97,9 @@ ARM 实机联调后再确认。
 ```text
 PING      -> PONG
 STATUS    -> STATUS
-WAIT_IRQ  -> IRQ
 ```
 
-主动上报的 `IRQ` 不会结束其他命令；等待 `STATUS` 时收到迟到的 `PONG` 也不会错误完成
+等待 `PING` 时收到迟到的 `STATUS`，或等待 `STATUS` 时收到迟到的 `PONG`，都不会错误完成
 当前命令。不匹配的响应仍会进入 RX 日志，并保留当前在途命令直到正确响应或超时。
 
 ### 6. 结构化设备状态
@@ -105,13 +107,12 @@ WAIT_IRQ  -> IRQ
 `OK STATUS` 不再由主窗口直接读取字符串键值。控制器校验并转换：
 
 ```text
-int / pa / com / rst
+pa / com / rst
 wr_state / wr_end
 corr_state / corr_end
 ```
 
 字段缺失或数值无效时不会发出有效状态，并将当前 `STATUS` 命令标记为失败。
-`OK IRQ count=...` 转换为独立的中断计数信号。
 
 ### 7. 收敛 MainWindow
 
@@ -121,7 +122,7 @@ corr_state / corr_end
 读取端口和波特率控件
 调用连接、断开和发送命令
 显示 TX/RX、命令完成和错误日志
-显示结构化 STATUS/IRQ
+显示结构化 STATUS
 根据设备状态控制菜单和按钮
 ```
 
@@ -137,7 +138,7 @@ corr_state / corr_end
 模拟串口连接和参数传递
 单条在途命令及重复发送拦截
 完整 STATUS 数值解析
-主动 IRQ 不结束 PING
+迟到 STATUS 不结束 PING
 迟到 PONG 不结束 STATUS
 命令响应超时
 错误状态下重试并恢复 Ready
@@ -179,7 +180,6 @@ Xvfb 无界面启动烟测正常，2 秒后由 timeout 终止
 ```text
 当前控制协议仍是单请求、单响应的 ASCII 行协议
 默认 5 秒响应超时需要 ARM 实机联调确认
-WAIT_IRQ 是否长期阻塞以及校准命令是否立即 ACK 尚未确认
 STATUS 字段按当前 README 中的完整响应格式校验
 图像数据仍走未来光口/PCIe 链路，不进入 SerialClient
 PCIe 帧头、DMA 缓冲区和驱动接口仍等待 FPGA/硬件条件

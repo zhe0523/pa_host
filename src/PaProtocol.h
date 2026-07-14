@@ -20,7 +20,6 @@ public:
     enum class Command {
         Ping,
         Status,
-        WaitIrq,
         LoadTemplate,
         MakeOffset,
         MakeGain,
@@ -35,7 +34,7 @@ public:
         bool error = false;          // true 表示响应以 ERR 开头
         QString keyword;             // OK/ERR 后面的第一个字段，例如 STATUS、PONG、UNKNOWN
         QString rawLine;             // 原始响应行，保留给日志窗口显示
-        QMap<QString, QString> kv;   // key=value 字段，例如 int=0x00000010
+        QMap<QString, QString> kv;   // key=value 字段，例如 wr_state=1
     };
 
     static QString commandText(Command command);

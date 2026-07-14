@@ -92,7 +92,6 @@ private:
     void handlePresentedFrame(const ImageFrame& frame);
     void updateDeviceState(PaDeviceState state);
     void updateDeviceStatus(const PaDeviceStatus& status);
-    void updateInterruptCount(quint64 count);
 
     SerialClient serial_;
     std::unique_ptr<AppSettings> settings_;

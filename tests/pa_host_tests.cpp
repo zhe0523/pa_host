@@ -140,18 +140,18 @@ bool testProtocolCommands() {
     CHECK(PaProtocol::commandText(PaProtocol::Command::Ping) == QStringLiteral("PING"));
     CHECK(PaProtocol::commandText(PaProtocol::Command::SendImage) == QStringLiteral("SEND_IMAGE"));
     CHECK(PaProtocol::commandName(PaProtocol::Command::SendImage) == QStringLiteral("手动上图"));
-    CHECK(PaProtocol::commandNames().size() == 10);
+    CHECK(PaProtocol::commandNames().size() == 9);
     return true;
 }
 
 bool testProtocolResponses() {
     const auto status = PaProtocol::parseResponse(
-        QStringLiteral("  OK   STATUS int=0x10 wr_state=2 corr_end=1  \r\n"));
+        QStringLiteral("  OK   STATUS pa=0x10 wr_state=2 corr_end=1  \r\n"));
     CHECK(status.ok);
     CHECK(!status.error);
     CHECK(status.keyword == QStringLiteral("STATUS"));
-    CHECK(status.rawLine == QStringLiteral("OK   STATUS int=0x10 wr_state=2 corr_end=1"));
-    CHECK(status.kv.value(QStringLiteral("int")) == QStringLiteral("0x10"));
+    CHECK(status.rawLine == QStringLiteral("OK   STATUS pa=0x10 wr_state=2 corr_end=1"));
+    CHECK(status.kv.value(QStringLiteral("pa")) == QStringLiteral("0x10"));
     CHECK(status.kv.value(QStringLiteral("wr_state")) == QStringLiteral("2"));
     CHECK(status.kv.value(QStringLiteral("corr_end")) == QStringLiteral("1"));
 
@@ -275,7 +275,6 @@ bool testPaDeviceController() {
     controller.setCommandTimeoutMs(15);
     QVector<CommandResult> results;
     QVector<PaDeviceStatus> statuses;
-    QVector<quint64> interruptCounts;
     QStringList errors;
     QObject::connect(&controller, &PaDeviceController::commandFinished,
         [&results](PaProtocol::Command command, bool success, const QString& detail) {
@@ -284,10 +283,6 @@ bool testPaDeviceController() {
     QObject::connect(&controller, &PaDeviceController::deviceStatusChanged,
         [&statuses](const PaDeviceStatus& status) {
             statuses.push_back(status);
-        });
-    QObject::connect(&controller, &PaDeviceController::interruptReceived,
-        [&interruptCounts](quint64 count) {
-            interruptCounts.push_back(count);
         });
     QObject::connect(&controller, &PaDeviceController::errorOccurred,
         [&errors](const QString& message) {
@@ -316,7 +311,7 @@ bool testPaDeviceController() {
     CHECK(controller.state() == PaDeviceState::Busy);
 
     transport.injectLine(QStringLiteral(
-        "OK STATUS int=0x10 pa=0x20 com=3 rst=4 wr_state=2 wr_end=1 corr_state=5 corr_end=0"));
+        "OK STATUS pa=0x20 com=3 rst=4 wr_state=2 wr_end=1 corr_state=5 corr_end=0"));
     CHECK(controller.state() == PaDeviceState::Ready);
     CHECK(!controller.hasPendingCommand());
     CHECK(results.size() == 1);
@@ -324,14 +319,14 @@ bool testPaDeviceController() {
     CHECK(results.last().success);
     CHECK(statuses.size() == 1);
     CHECK(statuses.last().valid);
-    CHECK(statuses.last().interruptFlags == 0x10);
     CHECK(statuses.last().paFlags == 0x20);
     CHECK(statuses.last().writeState == 2);
     CHECK(statuses.last().correctionState == 5);
 
     CHECK(controller.sendCommand(PaProtocol::Command::Ping, &error));
-    transport.injectLine(QStringLiteral("OK IRQ count=7"));
-    CHECK(interruptCounts == QVector<quint64>({7}));
+    transport.injectLine(QStringLiteral(
+        "OK STATUS pa=0x21 com=3 rst=4 wr_state=2 wr_end=1 corr_state=5 corr_end=0"));
+    CHECK(statuses.size() == 2);
     CHECK(controller.hasPendingCommand());
     CHECK(controller.state() == PaDeviceState::Busy);
     transport.injectLine(QStringLiteral("OK PONG"));

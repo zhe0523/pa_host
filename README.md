@@ -34,12 +34,14 @@ src/TiRawImage.*     Windows 样例 .tiraw 16-bit 灰度图读取、自动窗宽
 src/ImageView.*      图像显示、缩放、平移、ROI 框选、保存
 doc/kylin-handover.md 给 Kylin 机器继续开发时看的交接文档
 doc/architecture.md   模块边界、算法替换和 PCIe 图像链路设计
+doc/communication-data-link-draft.md RS422 控制通信与 PCIe 图像数据链路协议草案
 doc/git-commit-note-20260710.md 图像交互阶段的中文提交说明
 doc/git-commit-note-20260714.md 架构解耦与图像回放阶段的中文提交说明
 doc/git-commit-note-20260714-image-list-replay-performance.md 图像列表、导出与回放性能阶段的中文提交说明
 doc/git-commit-note-20260714-ui-replay-decoupling.md 图像界面与回放呈现解耦阶段的中文提交说明
 doc/git-commit-note-20260714-device-control-decoupling.md RS422 设备控制链路解耦阶段的中文提交说明
 doc/git-commit-note-20260714-logging-settings.md 运行日志与应用配置基础设施阶段的中文提交说明
+doc/git-commit-note-20260714-communication-protocol-correction.md 通信协议纠正与数据链路草案阶段的中文提交说明
 ```
 
 ## 构建
@@ -107,7 +109,7 @@ ctest --output-on-failure
 
 ```text
 PA/ARM 命令字符串和 OK/ERR 响应解析
-PA 设备连接、单命令在途、STATUS/IRQ、超时和传输错误恢复
+PA 设备连接、单命令在途、STATUS、超时和传输错误恢复
 AppSettings 配置默认值、持久化和数值边界
 AppLogService 日志格式、滚动归档和诊断导出
 .tiraw 正常文件头、尺寸、像素读取
@@ -210,7 +212,6 @@ DCM 暂未实现。DICOM 需要明确设备、检查和图像元数据以及编�
 ```text
 PING
 STATUS
-WAIT_IRQ
 LOAD_TEMPLATE
 MAKE_OFFSET
 MAKE_GAIN
@@ -226,7 +227,7 @@ QUIT
 
 ```text
 OK PONG
-OK STATUS int=0x00000000 pa=0x00000000 com=0x00000000 rst=0x00000000 wr_state=0 wr_end=0 corr_state=0 corr_end=0
+OK STATUS pa=0x00000000 com=0x00000000 rst=0x00000000 wr_state=0 wr_end=0 corr_state=0 corr_end=0
 ERR UNKNOWN
 ```
 
@@ -291,7 +292,7 @@ Shift+ROI 按区域重算窗位窗宽
 多图打开、缩略图列表、点击切换和批量移除
 图像列表右键导出 TiRaw、RAW16、PNG、TIFF、BMP 和 JPEG
 连续帧实际 FPS、错误和完成统计
-RS422 命令状态、超时和结构化 STATUS/IRQ 处理
+RS422 命令状态、超时和结构化 STATUS 处理
 分级滚动日志、运行日志 Dock 和诊断文本导出
 串口参数、命令超时和最近目录持久化
 相同尺寸连续帧保持当前图像视图状态

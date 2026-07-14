@@ -177,7 +177,7 @@ MainWindow
 
 ```text
 MainWindow          连接界面操作和结构化设备状态，不解析 ASCII 文本
-PaDeviceController  管理连接状态、单条在途命令、5 秒超时和 STATUS/IRQ 数据
+PaDeviceController  管理连接状态、单条在途命令、5 秒超时和 STATUS 数据
 PaProtocol          定义命令文本并将响应行拆成 keyword 和 key=value
 ILineTransport      定义打开、关闭、发送行和接收行，不依赖 QSerialPort
 SerialClient        实现 Linux/Windows 串口参数、收发缓存和完整行切分
@@ -185,9 +185,11 @@ SerialClient        实现 Linux/Windows 串口参数、收发缓存和完整行
 
 控制器同一时间只允许一条命令在途，防止响应无法对应命令。命令执行期间界面禁用其他 PA/FPGA 命令；响应成功后恢复 `Ready`，设备返回 `ERR`、响应超时或传输错误后进入 `Error`。串口仍打开时允许从错误状态直接重试，断开连接会取消在途命令。
 
-自动测试使用内存模拟的 `ILineTransport`，不需要串口硬件即可验证连接、状态解析、主动 IRQ、重复命令拦截、超时、错误恢复和打开失败。
+自动测试使用内存模拟的 `ILineTransport`，不需要串口硬件即可验证连接、状态解析、迟到响应隔离、重复命令拦截、超时、错误恢复和打开失败。
 
 图像数据走光口/PCIe，不应混入 `SerialClient`。未来如果协议改成二进制或增加校验，只替换 `PaProtocol`、控制器及对应传输边界。
+
+FPGA 通过 MSI/MSI-X 产生的硬件中断只属于 PCIe 驱动内部，用于完成 DMA 或唤醒阻塞读取。RS422 业务协议不暴露 `WAIT_IRQ`、通用 IRQ 计数或其他硬件实现细节；ARM 需要主动通知上位机时，应转换为校准完成、设备故障等带明确语义的事件。
 
 ## 后续实施顺序
 

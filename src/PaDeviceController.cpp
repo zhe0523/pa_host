@@ -195,14 +195,6 @@ void PaDeviceController::handleLineReceived(const QString& line) {
         } else {
             emit errorOccurred(payloadError);
         }
-    } else if (response.ok && response.keyword == QStringLiteral("IRQ")) {
-        const quint64 count = response.kv.value(QStringLiteral("count")).toULongLong(&payloadValid, 0);
-        if (payloadValid) {
-            emit interruptReceived(count);
-        } else {
-            payloadError = QStringLiteral("IRQ 响应缺少有效 count 字段: %1").arg(response.rawLine);
-            emit errorOccurred(payloadError);
-        }
     }
 
     if (!pendingCommand_.has_value()) {
@@ -261,18 +253,15 @@ bool PaDeviceController::responseMatchesPendingCommand(
         return true;
     }
 
-    // 这三类响应也可能迟到或由设备主动上报，必须与在途命令严格对应。
+    // PONG 和 STATUS 可能迟到，必须与在途命令严格对应。
     switch (pendingCommand_.value()) {
     case PaProtocol::Command::Ping:
         return response.keyword == QStringLiteral("PONG");
     case PaProtocol::Command::Status:
         return response.keyword == QStringLiteral("STATUS");
-    case PaProtocol::Command::WaitIrq:
-        return response.keyword == QStringLiteral("IRQ");
     default:
         return response.keyword != QStringLiteral("PONG")
-            && response.keyword != QStringLiteral("STATUS")
-            && response.keyword != QStringLiteral("IRQ");
+            && response.keyword != QStringLiteral("STATUS");
     }
 }
 
@@ -286,8 +275,7 @@ bool PaDeviceController::parseDeviceStatus(
 
     PaDeviceStatus parsed;
     parsed.rawLine = response.rawLine;
-    const bool valid = readUnsignedField(response.kv, QStringLiteral("int"), &parsed.interruptFlags)
-        && readUnsignedField(response.kv, QStringLiteral("pa"), &parsed.paFlags)
+    const bool valid = readUnsignedField(response.kv, QStringLiteral("pa"), &parsed.paFlags)
         && readUnsignedField(response.kv, QStringLiteral("com"), &parsed.communicationFlags)
         && readUnsignedField(response.kv, QStringLiteral("rst"), &parsed.resetFlags)
         && readIntField(response.kv, QStringLiteral("wr_state"), &parsed.writeState)

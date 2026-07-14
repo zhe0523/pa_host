@@ -122,7 +122,7 @@ ctest --output-on-failure
 
 当前覆盖协议解析、`.tiraw` 文件校验、像素读取、自动窗宽窗位、ROI 统计和显示映射。
 
-自动测试也覆盖 `AppSettings`、`AppLogService`、`PaDeviceController`、`ImageSession`、`ImageExportService`、`ReplayPresentationScheduler`、`FramePresentationController` 与本地连续回放源：包括配置持久化与边界、日志滚动和诊断导出、模拟 RS422 连接、结构化 STATUS/IRQ、命令超时与错误恢复、导出格式与写盘、60 fps 时间补偿、最新帧覆盖与丢帧统计、回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
+自动测试也覆盖 `AppSettings`、`AppLogService`、`PaDeviceController`、`ImageSession`、`ImageExportService`、`ReplayPresentationScheduler`、`FramePresentationController` 与本地连续回放源：包括配置持久化与边界、日志滚动和诊断导出、模拟 RS422 连接、结构化 STATUS、迟到响应隔离、命令超时与错误恢复、导出格式与写盘、60 fps 时间补偿、最新帧覆盖与丢帧统计、回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
 
 核心代码已经拆成 `pa_core`、`pa_transport` 和 `pa_host` 三个 CMake 目标。图像列表、
 导出编码、回放呈现和帧率计算也已分别迁移到 `ImageListPanel`、`ImageExportService`、

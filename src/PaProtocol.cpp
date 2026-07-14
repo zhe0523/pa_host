@@ -9,8 +9,6 @@ QString PaProtocol::commandText(Command command) {
         return "PING";
     case Command::Status:
         return "STATUS";
-    case Command::WaitIrq:
-        return "WAIT_IRQ";
     case Command::LoadTemplate:
         return "LOAD_TEMPLATE";
     case Command::MakeOffset:
@@ -35,8 +33,6 @@ QString PaProtocol::commandName(Command command) {
         return QStringLiteral("心跳");
     case Command::Status:
         return QStringLiteral("读取状态");
-    case Command::WaitIrq:
-        return QStringLiteral("等待中断");
     case Command::LoadTemplate:
         return QStringLiteral("加载模板");
     case Command::MakeOffset:
@@ -59,7 +55,6 @@ QStringList PaProtocol::commandNames() {
     return {
         commandText(Command::Ping),
         commandText(Command::Status),
-        commandText(Command::WaitIrq),
         commandText(Command::LoadTemplate),
         commandText(Command::MakeOffset),
         commandText(Command::MakeGain),
@@ -92,7 +87,7 @@ PaProtocol::Response PaProtocol::parseResponse(const QString& line) {
 
     /*
      * ARM STATUS 响应形如：
-     * OK STATUS int=0x... pa=0x... wr_state=...
+     * OK STATUS pa=0x... com=0x... wr_state=...
      *
      * 这里按 key=value 泛化解析，避免 UI 依赖固定字段顺序。
      */
