@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMap>
+#include <QMetaType>
 #include <QString>
 #include <QStringList>
 
@@ -43,3 +44,4 @@ public:
     static Response parseResponse(const QString& line);
 };
 
+Q_DECLARE_METATYPE(PaProtocol::Command)

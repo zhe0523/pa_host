@@ -122,7 +122,7 @@ ctest --output-on-failure
 
 当前覆盖协议解析、`.tiraw` 文件校验、像素读取、自动窗宽窗位、ROI 统计和显示映射。
 
-自动测试也覆盖 `ImageSession`、`ImageExportService`、`ReplayPresentationScheduler`、`FramePresentationController` 与本地连续回放源：包括导出格式与写盘、60 fps 时间补偿、最新帧覆盖与丢帧统计、回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
+自动测试也覆盖 `PaDeviceController`、`ImageSession`、`ImageExportService`、`ReplayPresentationScheduler`、`FramePresentationController` 与本地连续回放源：包括模拟 RS422 连接、结构化 STATUS/IRQ、命令超时与错误恢复、导出格式与写盘、60 fps 时间补偿、最新帧覆盖与丢帧统计、回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
 
 核心代码已经拆成 `pa_core`、`pa_transport` 和 `pa_host` 三个 CMake 目标。图像列表、
 导出编码、回放呈现和帧率计算也已分别迁移到 `ImageListPanel`、`ImageExportService`、
@@ -195,6 +195,10 @@ python3 tools/check_tiraw.py /home/zhe/app/windows/tidetector/CollectImage/20260
 4. 点击“心跳”，日志应收到 OK PONG。
 5. 点击“读取状态”，日志应收到 OK STATUS ...
 ```
+
+未连接时 PA/FPGA 菜单和顶部“手动上图”等命令按钮不可用。命令发送后状态栏显示
+“RS422: 执行中”，同一时间不允许重复发送；5 秒内没有收到可识别响应会记录超时并
+显示“RS422: 错误”。如果串口仍然打开，可以直接重试，成功响应后恢复“已连接”。
 
 ## 当前代码边界
 

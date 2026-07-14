@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QHash>
+#include <QList>
 #include <QMainWindow>
 #include <QPlainTextEdit>
 #include <QPoint>
@@ -24,10 +25,14 @@
 
 class QCheckBox;
 class QComboBox;
+class QPushButton;
 class QSlider;
 class QAction;
 class FramePresentationController;
 class ImageListPanel;
+class PaDeviceController;
+enum class PaDeviceState;
+struct PaDeviceStatus;
 
 /*
  * 主窗口。
@@ -51,8 +56,6 @@ private slots:
     void connectSerial();
     void disconnectSerial();
     void sendCommand(PaProtocol::Command command);
-    void handleLineReceived(const QString& line);
-    void handleSerialError(const QString& message);
     void updateWindowLevel();
     void toggleImageMaximized();
 
@@ -80,12 +83,15 @@ private:
     void handleAnalysisRoi(const QRect& imageRect);
     void applyWindowLevelFromRoi(const QRect& imageRect);
     void handlePresentedFrame(const ImageFrame& frame);
-    void updateStatusFromResponse(const PaProtocol::Response& response);
+    void updateDeviceState(PaDeviceState state);
+    void updateDeviceStatus(const PaDeviceStatus& status);
+    void updateInterruptCount(quint64 count);
 
     SerialClient serial_;
     std::unique_ptr<ImageSession> imageSession_;
     LocalReplaySource* replaySource_ = nullptr;
     FramePresentationController* presentationController_ = nullptr;
+    PaDeviceController* deviceController_ = nullptr;
 
     QWidget* topBar_ = nullptr;
     ImageListPanel* imageListPanel_ = nullptr;
@@ -93,9 +99,15 @@ private:
     ImageView* imageView_ = nullptr;
     QTextEdit* logView_ = nullptr;
     QAction* imageMaximizeAction_ = nullptr;
+    QAction* refreshPortsAction_ = nullptr;
+    QAction* connectSerialAction_ = nullptr;
+    QAction* disconnectSerialAction_ = nullptr;
+    QList<QAction*> deviceCommandActions_;
 
     QComboBox* portCombo_ = nullptr;
     QSpinBox* baudSpin_ = nullptr;
+    QPushButton* manualImageButton_ = nullptr;
+    QPushButton* statusButton_ = nullptr;
 
     QCheckBox* autoWindowCheck_ = nullptr;
     QSlider* centerSlider_ = nullptr;

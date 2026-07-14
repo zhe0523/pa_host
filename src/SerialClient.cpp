@@ -3,7 +3,7 @@
 #include <QSerialPortInfo>
 
 SerialClient::SerialClient(QObject* parent)
-    : QObject(parent) {
+    : ILineTransport(parent) {
     connect(&serial_, &QSerialPort::readyRead, this, &SerialClient::handleReadyRead);
     connect(&serial_, &QSerialPort::errorOccurred, this, &SerialClient::handleSerialError);
 }
@@ -97,4 +97,3 @@ void SerialClient::handleSerialError(QSerialPort::SerialPortError error) {
     }
     emit errorOccurred(serial_.errorString());
 }
-

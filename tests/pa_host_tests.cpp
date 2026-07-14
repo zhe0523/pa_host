@@ -1,9 +1,11 @@
 #include "FramePresentationController.h"
+#include "ILineTransport.h"
 #include "ImageAlgorithms.h"
 #include "ImageExportService.h"
 #include "ImageSession.h"
 #include "ImageSource.h"
 #include "MtfAnalysis.h"
+#include "PaDeviceController.h"
 #include "PaProtocol.h"
 #include "ReplayPresentationScheduler.h"
 #include "TiRawImage.h"
@@ -21,6 +23,69 @@ namespace {
 struct TestCase {
     const char* name;
     std::function<bool()> run;
+};
+
+class FakeLineTransport final : public ILineTransport {
+public:
+    explicit FakeLineTransport(QObject* parent = nullptr)
+        : ILineTransport(parent) {
+    }
+
+    bool open(const QString& portName, int baudRate, QString* errorMessage) override {
+        lastPortName = portName;
+        lastBaudRate = baudRate;
+        if (failOpen) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("模拟打开失败");
+            }
+            emit connectionChanged(false);
+            return false;
+        }
+        openState = true;
+        emit connectionChanged(true);
+        return true;
+    }
+
+    void close() override {
+        openState = false;
+        emit connectionChanged(false);
+    }
+
+    bool isOpen() const override {
+        return openState;
+    }
+
+    QString portName() const override {
+        return lastPortName;
+    }
+
+    bool sendLine(const QString& line, QString* errorMessage) override {
+        if (!openState || failSend) {
+            if (errorMessage != nullptr) {
+                *errorMessage = failSend
+                    ? QStringLiteral("模拟发送失败")
+                    : QStringLiteral("模拟传输未打开");
+            }
+            return false;
+        }
+        sentLines.push_back(line);
+        return true;
+    }
+
+    void injectLine(const QString& line) {
+        emit lineReceived(line);
+    }
+
+    void injectError(const QString& message) {
+        emit errorOccurred(message);
+    }
+
+    bool openState = false;
+    bool failOpen = false;
+    bool failSend = false;
+    QString lastPortName;
+    int lastBaudRate = 0;
+    QStringList sentLines;
 };
 
 void appendLe16(QByteArray* data, quint16 value) {
@@ -96,6 +161,119 @@ bool testProtocolResponses() {
     CHECK(!empty.ok);
     CHECK(!empty.error);
     CHECK(empty.keyword.isEmpty());
+    return true;
+}
+
+bool testPaDeviceController() {
+    struct CommandResult {
+        PaProtocol::Command command;
+        bool success = false;
+        QString detail;
+    };
+
+    FakeLineTransport transport;
+    PaDeviceController controller(&transport);
+    controller.setCommandTimeoutMs(15);
+    QVector<CommandResult> results;
+    QVector<PaDeviceStatus> statuses;
+    QVector<quint64> interruptCounts;
+    QStringList errors;
+    QObject::connect(&controller, &PaDeviceController::commandFinished,
+        [&results](PaProtocol::Command command, bool success, const QString& detail) {
+            results.push_back({command, success, detail});
+        });
+    QObject::connect(&controller, &PaDeviceController::deviceStatusChanged,
+        [&statuses](const PaDeviceStatus& status) {
+            statuses.push_back(status);
+        });
+    QObject::connect(&controller, &PaDeviceController::interruptReceived,
+        [&interruptCounts](quint64 count) {
+            interruptCounts.push_back(count);
+        });
+    QObject::connect(&controller, &PaDeviceController::errorOccurred,
+        [&errors](const QString& message) {
+            errors.push_back(message);
+        });
+
+    QString error;
+    CHECK(controller.state() == PaDeviceState::Disconnected);
+    CHECK(!controller.sendCommand(PaProtocol::Command::Ping, &error));
+    CHECK(error == QStringLiteral("串口未连接"));
+
+    CHECK(controller.connectDevice(QStringLiteral("COM_TEST"), 115200, &error));
+    CHECK(controller.isConnected());
+    CHECK(controller.state() == PaDeviceState::Ready);
+    CHECK(transport.lastPortName == QStringLiteral("COM_TEST"));
+    CHECK(transport.lastBaudRate == 115200);
+
+    CHECK(controller.sendCommand(PaProtocol::Command::Status, &error));
+    CHECK(controller.state() == PaDeviceState::Busy);
+    CHECK(controller.hasPendingCommand());
+    CHECK(transport.sentLines.last() == QStringLiteral("STATUS"));
+    CHECK(!controller.sendCommand(PaProtocol::Command::Ping, &error));
+    CHECK(error == QStringLiteral("上一条命令尚未完成"));
+    transport.injectLine(QStringLiteral("OK PONG"));
+    CHECK(controller.hasPendingCommand());
+    CHECK(controller.state() == PaDeviceState::Busy);
+
+    transport.injectLine(QStringLiteral(
+        "OK STATUS int=0x10 pa=0x20 com=3 rst=4 wr_state=2 wr_end=1 corr_state=5 corr_end=0"));
+    CHECK(controller.state() == PaDeviceState::Ready);
+    CHECK(!controller.hasPendingCommand());
+    CHECK(results.size() == 1);
+    CHECK(results.last().command == PaProtocol::Command::Status);
+    CHECK(results.last().success);
+    CHECK(statuses.size() == 1);
+    CHECK(statuses.last().valid);
+    CHECK(statuses.last().interruptFlags == 0x10);
+    CHECK(statuses.last().paFlags == 0x20);
+    CHECK(statuses.last().writeState == 2);
+    CHECK(statuses.last().correctionState == 5);
+
+    CHECK(controller.sendCommand(PaProtocol::Command::Ping, &error));
+    transport.injectLine(QStringLiteral("OK IRQ count=7"));
+    CHECK(interruptCounts == QVector<quint64>({7}));
+    CHECK(controller.hasPendingCommand());
+    CHECK(controller.state() == PaDeviceState::Busy);
+    transport.injectLine(QStringLiteral("OK PONG"));
+    CHECK(controller.state() == PaDeviceState::Ready);
+    CHECK(results.size() == 2);
+    CHECK(results.last().success);
+
+    CHECK(controller.sendCommand(PaProtocol::Command::Ping, &error));
+    QEventLoop timeoutLoop;
+    QTimer::singleShot(40, &timeoutLoop, &QEventLoop::quit);
+    timeoutLoop.exec();
+    CHECK(controller.state() == PaDeviceState::Error);
+    CHECK(!controller.hasPendingCommand());
+    CHECK(results.size() == 3);
+    CHECK(!results.last().success);
+    CHECK(results.last().detail.contains(QStringLiteral("超时")));
+
+    // 错误状态下允许重试，成功响应后恢复 Ready。
+    CHECK(controller.sendCommand(PaProtocol::Command::Ping, &error));
+    transport.injectLine(QStringLiteral("OK PONG"));
+    CHECK(controller.state() == PaDeviceState::Ready);
+    CHECK(results.last().success);
+
+    CHECK(controller.sendCommand(PaProtocol::Command::Status, &error));
+    transport.injectError(QStringLiteral("模拟链路故障"));
+    CHECK(controller.state() == PaDeviceState::Error);
+    CHECK(!controller.hasPendingCommand());
+    CHECK(!results.last().success);
+    CHECK(results.last().detail.contains(QStringLiteral("模拟链路故障")));
+
+    controller.disconnectDevice();
+    CHECK(!controller.isConnected());
+    CHECK(controller.state() == PaDeviceState::Disconnected);
+
+    FakeLineTransport failedTransport;
+    failedTransport.failOpen = true;
+    PaDeviceController failedController(&failedTransport);
+    CHECK(!failedController.connectDevice(QStringLiteral("BAD"), 9600, &error));
+    CHECK(error == QStringLiteral("模拟打开失败"));
+    CHECK(failedController.state() == PaDeviceState::Error);
+    CHECK(!errors.isEmpty());
     return true;
 }
 
@@ -520,6 +698,7 @@ int main(int argc, char* argv[]) {
     const TestCase tests[] = {
         {"protocol_commands", testProtocolCommands},
         {"protocol_responses", testProtocolResponses},
+        {"pa_device_controller", testPaDeviceController},
         {"tiraw_parsing_and_roi", testTirawParsingAndRoi},
         {"auto_window_level", testAutoWindowLevel},
         {"image_algorithm_boundary", testImageAlgorithmBoundary},

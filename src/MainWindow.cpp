@@ -3,6 +3,7 @@
 #include "FramePresentationController.h"
 #include "ImageExportService.h"
 #include "ImageListPanel.h"
+#include "PaDeviceController.h"
 
 #include <QAction>
 #include <QBoxLayout>
@@ -212,6 +213,7 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     imageSession_ = std::make_unique<ImageSession>(std::move(algorithms), this);
     replaySource_ = new LocalReplaySource(this);
     presentationController_ = new FramePresentationController(this);
+    deviceController_ = new PaDeviceController(&serial_, this);
     replayDisplayCache_.setMaxCost(4);
     setWindowTitle(QStringLiteral("PA Host"));
     setMinimumSize(1180, 820);
@@ -247,10 +249,26 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     setCentralWidget(root);
     createStatusBar();
 
-    connect(&serial_, &SerialClient::lineReceived, this, &MainWindow::handleLineReceived);
-    connect(&serial_, &SerialClient::errorOccurred, this, &MainWindow::handleSerialError);
-    connect(&serial_, &SerialClient::connectionChanged, this, [this](bool connected) {
-        connectionLabel_->setText(connected ? QStringLiteral("RS422: 已连接") : QStringLiteral("RS422: 未连接"));
+    connect(deviceController_, &PaDeviceController::stateChanged,
+        this, &MainWindow::updateDeviceState);
+    connect(deviceController_, &PaDeviceController::deviceStatusChanged,
+        this, &MainWindow::updateDeviceStatus);
+    connect(deviceController_, &PaDeviceController::interruptReceived,
+        this, &MainWindow::updateInterruptCount);
+    connect(deviceController_, &PaDeviceController::lineTransmitted, this, [this](const QString& line) {
+        appendLog(QStringLiteral("TX: %1").arg(line));
+    });
+    connect(deviceController_, &PaDeviceController::lineReceived, this, [this](const QString& line) {
+        appendLog(QStringLiteral("RX: %1").arg(line));
+    });
+    connect(deviceController_, &PaDeviceController::errorOccurred, this, [this](const QString& message) {
+        appendLog(QStringLiteral("控制错误: %1").arg(message));
+    });
+    connect(deviceController_, &PaDeviceController::commandFinished, this,
+        [this](PaProtocol::Command command, bool success, const QString& detail) {
+            appendLog(QStringLiteral("命令%1: %2, %3")
+                          .arg(success ? QStringLiteral("完成") : QStringLiteral("失败"))
+                          .arg(PaProtocol::commandName(command), detail));
     });
     connect(imageView_, &ImageView::zoomChanged, this, [this](int percent) {
         progressLabel_->setText(QStringLiteral("缩放: %1%").arg(percent));
@@ -295,6 +313,7 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     });
     imageInfoRefreshTimer_.setSingleShot(true);
     connect(&imageInfoRefreshTimer_, &QTimer::timeout, this, &MainWindow::updateFullImageInfo);
+    updateDeviceState(deviceController_->state());
 }
 
 void MainWindow::openImage() {
@@ -447,36 +466,21 @@ void MainWindow::saveDisplayImage() {
 
 void MainWindow::connectSerial() {
     QString error;
-    if (!serial_.open(portCombo_->currentText(), baudSpin_->value(), &error)) {
+    if (!deviceController_->connectDevice(portCombo_->currentText(), baudSpin_->value(), &error)) {
         QMessageBox::warning(this, QStringLiteral("串口打开失败"), error);
-        appendLog(QStringLiteral("串口打开失败: %1").arg(error));
         return;
     }
     appendLog(QStringLiteral("串口已打开: %1 @ %2").arg(portCombo_->currentText()).arg(baudSpin_->value()));
 }
 
 void MainWindow::disconnectSerial() {
-    serial_.close();
+    deviceController_->disconnectDevice();
     appendLog(QStringLiteral("串口已关闭"));
 }
 
 void MainWindow::sendCommand(PaProtocol::Command command) {
-    const QString text = PaProtocol::commandText(command);
     QString error;
-    if (!serial_.sendLine(text, &error)) {
-        appendLog(QStringLiteral("发送失败: %1, %2").arg(text, error));
-        return;
-    }
-    appendLog(QStringLiteral("TX: %1").arg(text));
-}
-
-void MainWindow::handleLineReceived(const QString& line) {
-    appendLog(QStringLiteral("RX: %1").arg(line));
-    updateStatusFromResponse(PaProtocol::parseResponse(line));
-}
-
-void MainWindow::handleSerialError(const QString& message) {
-    appendLog(QStringLiteral("串口错误: %1").arg(message));
+    deviceController_->sendCommand(command, &error);
 }
 
 void MainWindow::updateWindowLevel() {
@@ -524,34 +528,34 @@ QWidget* MainWindow::createTopBar() {
 
     auto* idleButton = new QPushButton(QStringLiteral("Idle"), bar);
     auto* continuousButton = new QPushButton(QStringLiteral("Continuous"), bar);
-    auto* manualButton = new QPushButton(QStringLiteral("手动上图"), bar);
-    auto* stopButton = new QPushButton(QStringLiteral("停止上图"), bar);
+    manualImageButton_ = new QPushButton(QStringLiteral("手动上图"), bar);
+    statusButton_ = new QPushButton(QStringLiteral("停止上图"), bar);
 
     idleButton->setCheckable(true);
     idleButton->setChecked(true);
     continuousButton->setCheckable(true);
     idleButton->setProperty("role", "mode");
     continuousButton->setProperty("role", "mode");
-    manualButton->setProperty("role", "primary");
-    stopButton->setProperty("role", "stop");
+    manualImageButton_->setProperty("role", "primary");
+    statusButton_->setProperty("role", "stop");
 
     auto* modeGroup = new QButtonGroup(bar);
     modeGroup->setExclusive(true);
     modeGroup->addButton(idleButton);
     modeGroup->addButton(continuousButton);
 
-    connect(manualButton, &QPushButton::clicked, this, [this]() {
+    connect(manualImageButton_, &QPushButton::clicked, this, [this]() {
         sendCommand(PaProtocol::Command::SendImage);
     });
-    connect(stopButton, &QPushButton::clicked, this, [this]() {
+    connect(statusButton_, &QPushButton::clicked, this, [this]() {
         sendCommand(PaProtocol::Command::Status);
     });
 
     layout->addWidget(idleButton);
     layout->addWidget(continuousButton);
     layout->addSpacing(18);
-    layout->addWidget(manualButton);
-    layout->addWidget(stopButton);
+    layout->addWidget(manualImageButton_);
+    layout->addWidget(statusButton_);
     layout->addStretch(1);
 
     return bar;
@@ -714,11 +718,13 @@ void MainWindow::createMenus() {
     serialMenu->addAction(baudAction);
 
     serialMenu->addSeparator();
-    serialMenu->addAction(QStringLiteral("刷新端口"), this, [this]() {
+    refreshPortsAction_ = serialMenu->addAction(QStringLiteral("刷新端口"), this, [this]() {
         populateSerialPorts(portCombo_);
     });
-    serialMenu->addAction(QStringLiteral("连接"), this, &MainWindow::connectSerial);
-    serialMenu->addAction(QStringLiteral("断开"), this, &MainWindow::disconnectSerial);
+    connectSerialAction_ = serialMenu->addAction(
+        QStringLiteral("连接"), this, &MainWindow::connectSerial);
+    disconnectSerialAction_ = serialMenu->addAction(
+        QStringLiteral("断开"), this, &MainWindow::disconnectSerial);
 
     auto* commandMenu = menuBar()->addMenu(QStringLiteral("PA/FPGA"));
     struct MenuCommand {
@@ -738,9 +744,10 @@ void MainWindow::createMenus() {
         {PaProtocol::Command::Quit, "退出 ARM"},
     };
     for (const MenuCommand& item : commands) {
-        commandMenu->addAction(QString::fromUtf8(item.text), this, [this, item]() {
+        QAction* action = commandMenu->addAction(QString::fromUtf8(item.text), this, [this, item]() {
             sendCommand(item.command);
         });
+        deviceCommandActions_.push_back(action);
     }
 
     auto* viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
@@ -1170,20 +1177,48 @@ void MainWindow::handlePresentedFrame(const ImageFrame& frame) {
     }
 }
 
-void MainWindow::updateStatusFromResponse(const PaProtocol::Response& response) {
-    if (response.ok) {
-        connectionLabel_->setText(QStringLiteral("RS422: 正常"));
-    } else if (response.error) {
-        connectionLabel_->setText(QStringLiteral("RS422: 错误"));
-    }
+void MainWindow::updateDeviceState(PaDeviceState state) {
+    const bool connected = deviceController_->isConnected();
+    const bool commandEnabled = connected && state != PaDeviceState::Busy;
 
-    if (response.keyword == "STATUS") {
-        const QString wrState = response.kv.value("wr_state", "--");
-        const QString wrEnd = response.kv.value("wr_end", "--");
-        const QString corrState = response.kv.value("corr_state", "--");
-        const QString corrEnd = response.kv.value("corr_end", "--");
-        modeLabel_->setText(QStringLiteral("wr:%1/%2 corr:%3/%4").arg(wrState, wrEnd, corrState, corrEnd));
-    } else if (response.keyword == "IRQ") {
-        modeLabel_->setText(QStringLiteral("IRQ count=%1").arg(response.kv.value("count", "--")));
+    portCombo_->setEnabled(!connected);
+    baudSpin_->setEnabled(!connected);
+    refreshPortsAction_->setEnabled(!connected);
+    connectSerialAction_->setEnabled(!connected);
+    disconnectSerialAction_->setEnabled(connected);
+    for (QAction* action : deviceCommandActions_) {
+        action->setEnabled(commandEnabled);
     }
+    manualImageButton_->setEnabled(commandEnabled);
+    statusButton_->setEnabled(commandEnabled);
+
+    switch (state) {
+    case PaDeviceState::Disconnected:
+        connectionLabel_->setText(QStringLiteral("RS422: 未连接"));
+        break;
+    case PaDeviceState::Ready:
+        connectionLabel_->setText(QStringLiteral("RS422: 已连接"));
+        break;
+    case PaDeviceState::Busy:
+        connectionLabel_->setText(QStringLiteral("RS422: 执行中"));
+        break;
+    case PaDeviceState::Error:
+        connectionLabel_->setText(QStringLiteral("RS422: 错误"));
+        break;
+    }
+}
+
+void MainWindow::updateDeviceStatus(const PaDeviceStatus& status) {
+    if (!status.valid) {
+        return;
+    }
+    modeLabel_->setText(QStringLiteral("wr:%1/%2 corr:%3/%4")
+                            .arg(status.writeState)
+                            .arg(status.writeEnd)
+                            .arg(status.correctionState)
+                            .arg(status.correctionEnd));
+}
+
+void MainWindow::updateInterruptCount(quint64 count) {
+    modeLabel_->setText(QStringLiteral("IRQ count=%1").arg(count));
 }
