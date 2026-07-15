@@ -26,6 +26,8 @@ add_library(pa_core STATIC
     src/AppSettings.h
     src/FramePresentationController.cpp
     src/FramePresentationController.h
+    src/ImageAcquisitionController.cpp
+    src/ImageAcquisitionController.h
     src/ILineTransport.cpp
     src/ILineTransport.h
     src/ImageExportService.cpp

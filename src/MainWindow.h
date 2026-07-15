@@ -30,7 +30,7 @@ class QMenu;
 class QPushButton;
 class QSlider;
 class QAction;
-class FramePresentationController;
+class ImageAcquisitionController;
 class ImageListPanel;
 class AppLogService;
 class AppSettings;
@@ -80,7 +80,7 @@ private:
     void exportImage(const QString& sourcePath, const QString& formatId);
     void showCurrentSessionImage(const QString& source, bool resetViewState);
     void clearCurrentImage();
-    void clearReplayDisplayCaches();
+    void clearFrameDisplayCaches();
     void scheduleImageRefresh(bool resetViewState = false);
     void refreshImage(bool resetViewState = false);
     void updatePixelInfo(const QPoint& imagePoint);
@@ -98,7 +98,7 @@ private:
     std::unique_ptr<ImageSession> imageSession_;
     AppLogService* logService_ = nullptr;
     LocalReplaySource* replaySource_ = nullptr;
-    FramePresentationController* presentationController_ = nullptr;
+    ImageAcquisitionController* acquisitionController_ = nullptr;
     PaDeviceController* deviceController_ = nullptr;
 
     QWidget* topBar_ = nullptr;
@@ -137,8 +137,8 @@ private:
 
     QTimer imageRefreshTimer_;
     QTimer imageInfoRefreshTimer_;
-    QCache<QString, QImage> replayDisplayCache_;
-    QHash<QString, TiRawImage::RoiStats> replayFullImageStatsCache_;
+    QCache<QString, QImage> frameDisplayCache_;
+    QHash<QString, TiRawImage::RoiStats> stableFrameStatsCache_;
     QElapsedTimer imageInfoTimer_;
     bool resetViewStateOnRefresh_ = false;
     bool imageMaximized_ = false;

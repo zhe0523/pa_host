@@ -25,6 +25,7 @@ public:
 
     void start(int targetFps);
     void stop();
+    void flushPendingFrame();
     bool isActive() const;
     int targetFps() const;
     FramePresentationStats stats() const;

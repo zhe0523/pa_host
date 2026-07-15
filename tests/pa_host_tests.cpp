@@ -2,6 +2,7 @@
 #include "AppSettings.h"
 #include "FramePresentationController.h"
 #include "ILineTransport.h"
+#include "ImageAcquisitionController.h"
 #include "ImageAlgorithms.h"
 #include "ImageExportService.h"
 #include "ImageSession.h"
@@ -90,6 +91,80 @@ public:
     QString lastPortName;
     int lastBaudRate = 0;
     QStringList sentLines;
+};
+
+class FakeImageSource final : public IImageSource {
+public:
+    explicit FakeImageSource(QObject* parent = nullptr)
+        : IImageSource(parent) {
+    }
+
+    bool start(QString* errorMessage) override {
+        stats_ = {};
+        if (failStart) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("模拟图像源启动失败");
+            }
+            return false;
+        }
+        running_ = true;
+        emit runningChanged(true);
+        if (emitFrameDuringStart) {
+            deliverFrame(startupFrame);
+        }
+        return true;
+    }
+
+    void stop() override {
+        if (!running_) {
+            return;
+        }
+        running_ = false;
+        emit runningChanged(false);
+    }
+
+    bool isRunning() const override {
+        return running_;
+    }
+
+    ImageSourceStats stats() const override {
+        return stats_;
+    }
+
+    void deliverFrame(const ImageFrame& frame) {
+        if (!running_) {
+            return;
+        }
+        ++stats_.deliveredFrames;
+        emit frameReady(frame);
+    }
+
+    void queueLateFrame(const ImageFrame& frame) {
+        QTimer::singleShot(0, this, [this, frame]() {
+            ++stats_.deliveredFrames;
+            emit frameReady(frame);
+        });
+    }
+
+    void finish() {
+        if (!running_) {
+            return;
+        }
+        running_ = false;
+        emit runningChanged(false);
+    }
+
+    void injectError(const QString& message) {
+        emit sourceError(message);
+    }
+
+    bool failStart = false;
+    bool emitFrameDuringStart = false;
+    ImageFrame startupFrame;
+
+private:
+    bool running_ = false;
+    ImageSourceStats stats_;
 };
 
 void appendLe16(QByteArray* data, quint16 value) {
@@ -521,6 +596,7 @@ bool testImageSession() {
     CHECK(session.loadFile(path, &error));
     CHECK(session.hasImage());
     CHECK(session.currentFrame().sourceName == QStringLiteral("session.tiraw"));
+    CHECK(session.currentFrame().contentCacheKey == QFileInfo(path).absoluteFilePath());
     CHECK(session.autoWindowLevel().valid);
     CHECK(!session.render(25, 30).isNull());
     TiRawImage::RoiStats stats;
@@ -636,6 +712,121 @@ bool testFramePresentationController() {
     return true;
 }
 
+bool testImageAcquisitionController() {
+    ImageAcquisitionController controller;
+    QVector<ImageAcquisitionState> states;
+    QVector<quint64> presentedSequences;
+    QVector<ImageAcquisitionStats> finishedStats;
+    QStringList errors;
+    QVector<double> actualFpsValues;
+    QObject::connect(&controller, &ImageAcquisitionController::stateChanged,
+        [&states](ImageAcquisitionState state) {
+            states.push_back(state);
+        });
+    QObject::connect(&controller, &ImageAcquisitionController::framePresented,
+        [&presentedSequences](const ImageFrame& frame) {
+            presentedSequences.push_back(frame.sequence);
+        });
+    QObject::connect(&controller, &ImageAcquisitionController::sessionFinished,
+        [&finishedStats](const ImageAcquisitionStats& stats) {
+            finishedStats.push_back(stats);
+        });
+    QObject::connect(&controller, &ImageAcquisitionController::errorOccurred,
+        [&errors](const QString& message) {
+            errors.push_back(message);
+        });
+    QObject::connect(&controller, &ImageAcquisitionController::fpsUpdated,
+        [&actualFpsValues](double actualFps, int) {
+            actualFpsValues.push_back(actualFps);
+        });
+
+    FakeImageSource source;
+    QString error;
+    CHECK(controller.start(&source, 60, &error));
+    CHECK(controller.state() == ImageAcquisitionState::Running);
+    CHECK(controller.isActive());
+    CHECK(controller.isRunning());
+    CHECK(controller.targetFps() == 60);
+    CHECK(!actualFpsValues.isEmpty());
+    CHECK(fuzzyEqual(actualFpsValues.first(), 0.0));
+
+    for (quint64 sequence = 1; sequence <= 3; ++sequence) {
+        ImageFrame frame;
+        frame.sequence = sequence;
+        source.deliverFrame(frame);
+    }
+    QEventLoop presentationLoop;
+    QTimer::singleShot(30, &presentationLoop, &QEventLoop::quit);
+    presentationLoop.exec();
+    CHECK(presentedSequences == QVector<quint64>({3}));
+    ImageAcquisitionStats stats = controller.stats();
+    CHECK(stats.source.deliveredFrames == 3);
+    CHECK(stats.presentation.submittedFrames == 3);
+    CHECK(stats.presentation.presentedFrames == 1);
+    CHECK(stats.presentation.droppedFrames == 2);
+
+    source.injectError(QStringLiteral("模拟源警告"));
+    CHECK(errors.last() == QStringLiteral("模拟源警告"));
+    controller.stop();
+    CHECK(controller.state() == ImageAcquisitionState::Idle);
+    CHECK(!source.isRunning());
+    CHECK(finishedStats.size() == 1);
+    CHECK(finishedStats.last().source.deliveredFrames == 3);
+    CHECK(finishedStats.last().presentation.presentedFrames == 1);
+    controller.stop();
+    CHECK(finishedStats.size() == 1);
+
+    CHECK(!controller.start(nullptr, 30, &error));
+    CHECK(controller.state() == ImageAcquisitionState::Error);
+    CHECK(error == QStringLiteral("图像源未配置"));
+
+    FakeImageSource failedSource;
+    failedSource.failStart = true;
+    CHECK(!controller.start(&failedSource, 30, &error));
+    CHECK(controller.state() == ImageAcquisitionState::Error);
+    CHECK(error == QStringLiteral("模拟图像源启动失败"));
+
+    auto* destroyedSource = new FakeImageSource;
+    CHECK(controller.start(destroyedSource, 30, &error));
+    const int finishedBeforeDestroy = finishedStats.size();
+    delete destroyedSource;
+    CHECK(controller.state() == ImageAcquisitionState::Error);
+    CHECK(errors.last() == QStringLiteral("图像源在会话期间被销毁"));
+    CHECK(finishedStats.size() == finishedBeforeDestroy + 1);
+
+    FakeImageSource synchronousSource;
+    synchronousSource.emitFrameDuringStart = true;
+    synchronousSource.startupFrame.sequence = 10;
+    presentedSequences.clear();
+    CHECK(controller.start(&synchronousSource, 30, &error));
+    QEventLoop synchronousLoop;
+    QTimer::singleShot(20, &synchronousLoop, &QEventLoop::quit);
+    synchronousLoop.exec();
+    CHECK(presentedSequences == QVector<quint64>({10}));
+    controller.stop();
+
+    FakeImageSource oldSource;
+    FakeImageSource newSource;
+    CHECK(controller.start(&oldSource, 30, &error));
+    ImageFrame oldFrame;
+    oldFrame.sequence = 99;
+    oldSource.queueLateFrame(oldFrame);
+    controller.stop();
+    presentedSequences.clear();
+    CHECK(controller.start(&newSource, 30, &error));
+    ImageFrame newFrame;
+    newFrame.sequence = 100;
+    newSource.deliverFrame(newFrame);
+    newSource.finish();
+    CHECK(presentedSequences == QVector<quint64>({100}));
+    CHECK(controller.state() == ImageAcquisitionState::Idle);
+    CHECK(!finishedStats.isEmpty());
+    CHECK(states.contains(ImageAcquisitionState::Starting));
+    CHECK(states.contains(ImageAcquisitionState::Running));
+    CHECK(states.contains(ImageAcquisitionState::Stopping));
+    return true;
+}
+
 bool testLocalReplaySource() {
     QTemporaryDir directory;
     CHECK(directory.isValid());
@@ -672,6 +863,7 @@ bool testLocalReplaySource() {
     CHECK(frames.size() == 2);
     CHECK(frames.at(0).sequence == 0);
     CHECK(frames.at(1).sequence == 1);
+    CHECK(frames.at(0).contentCacheKey == QFileInfo(first).absoluteFilePath());
     CHECK(frames.at(0).image.minValue() == 1);
     CHECK(runningWhileDelivering);
     CHECK(!source.isRunning());
@@ -802,6 +994,7 @@ int main(int argc, char* argv[]) {
         {"image_export_service", testImageExportService},
         {"replay_presentation_scheduler", testReplayPresentationScheduler},
         {"frame_presentation_controller", testFramePresentationController},
+        {"image_acquisition_controller", testImageAcquisitionController},
         {"local_replay_source", testLocalReplaySource},
         {"invalid_tiraw_files", testInvalidTirawFiles},
         {"mtf_analysis_and_export", testMtfAnalysisAndExport},

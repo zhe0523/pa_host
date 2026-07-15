@@ -21,6 +21,7 @@ bool ImageSession::loadFile(const QString& path, QString* errorMessage) {
     ImageFrame frame;
     frame.image = std::move(image);
     frame.sourceName = QFileInfo(path).fileName();
+    frame.contentCacheKey = QFileInfo(path).absoluteFilePath();
     frame.receivedAt = QDateTime::currentDateTimeUtc();
     return setFrame(frame, errorMessage);
 }

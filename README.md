@@ -23,6 +23,7 @@ src/ImageListPanel.* 左侧图像列表、缩略图、选择、移除和右键�
 src/ImageExportService.* 原始图像和显示图像导出服务
 src/ImageAlgorithms.* 图像算法接口和当前内置实现，旧算法从这里替换
 src/ImageSource.*    图像源抽象和本地 .tiraw 连续回放实现
+src/ImageAcquisitionController.* 图像源会话、状态、停止顺序和统计汇总
 src/ImageSession.*   当前图像帧、显示渲染和算法调用的应用层边界
 src/FramePresentationController.* 最新帧选择、显示限速、实际 FPS 和丢帧统计
 src/ReplayPresentationScheduler.* 1～120 fps 显示时间调度策略
@@ -42,6 +43,7 @@ doc/git-commit-note-20260714-ui-replay-decoupling.md 图像界面与回放呈现
 doc/git-commit-note-20260714-device-control-decoupling.md RS422 设备控制链路解耦阶段的中文提交说明
 doc/git-commit-note-20260714-logging-settings.md 运行日志与应用配置基础设施阶段的中文提交说明
 doc/git-commit-note-20260714-communication-protocol-correction.md 通信协议纠正与数据链路草案阶段的中文提交说明
+doc/git-commit-note-20260715-image-acquisition-controller.md 图像采集会话解耦阶段的中文提交说明
 ```
 
 ## 构建
@@ -124,6 +126,7 @@ ImageSession 文件加载、当前帧、ROI 和显示渲染
 ImageExportService 格式元数据、后缀、RAW16 和显示图导出
 ReplayPresentationScheduler 60 fps 补偿、迟到追帧和帧率边界
 FramePresentationController 最新帧覆盖、停止丢帧和统计周期重置
+ImageAcquisitionController 启停、首帧、源销毁、自然结束和迟到帧隔离
 LocalReplaySource 帧序号、停止状态、快速重启、坏文件跳过和统计
 ESF / LSF / MTF 基础分析与 CSV 导出
 ```
@@ -140,7 +143,7 @@ pa_host_tests 无界面核心测试
 pa_image_benchmark 真实 TiRaw 性能基准工具
 ```
 
-`MainWindow` 只负责模块组装和跨模块工作流：图像列表内部行为由 `ImageListPanel` 管理，文件编码由 `ImageExportService` 管理，回放帧选择、限速和统计由 `FramePresentationController` 管理，纯时间计算由 `ReplayPresentationScheduler` 管理。主窗口不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
+`MainWindow` 只负责模块组装和跨模块工作流：图像列表内部行为由 `ImageListPanel` 管理，文件编码由 `ImageExportService` 管理，图像源启停和会话统计由 `ImageAcquisitionController` 管理，显示限速由 `FramePresentationController` 管理，纯时间计算由 `ReplayPresentationScheduler` 管理。主窗口不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
 
 RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命令、响应和 5 秒超时；`MainWindow` 不再解析 ASCII 响应。未连接或命令执行中时，PA/FPGA 命令会自动禁用。设备返回有效响应、发生超时或传输错误后，控制器会统一恢复或切换错误状态。错误状态下如果串口仍保持打开，可以直接重试命令。
 
@@ -184,11 +187,11 @@ Shift+左键拖框：按 ROI 重新计算窗位/窗宽
 文件 -> 停止图像回放：停止本地回放
 ```
 
-回放使用和未来 PCIe 相同的 `IImageSource -> FramePresentationController -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际显示 FPS。PCIe 尚未接入。
+回放使用和未来 PCIe 相同的 `IImageSource -> ImageAcquisitionController -> FramePresentationController -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际显示 FPS。PCIe 尚未接入。
 
 普通图像列表只保存文件路径和缩略图，不常驻缓存所有 16-bit 原始图像。点击列表项时重新加载对应文件；选中一项或多项后，可点击“移除选中图像”、按 Delete，或使用右键菜单移除。移除只影响列表，不会删除磁盘上的源文件。
 
-本地回放针对当前固定的 2～3 帧使用预加载：开始回放时读取并解析一次原始图像，循环时复用内存帧；日志会记录成功预加载帧数和耗时。主窗口最多缓存 4 张当前窗宽窗位下的 8-bit 显示图，`ImageView` 还会在 128 MiB 上限内缓存对应 `QPixmap`，避免无显卡或远程桌面环境反复做显示格式转换。首帧立即提交，后续显示节拍跟随用户设置的 1～120 fps；累计时间基准会自动补偿整数毫秒定时误差。处理速度跟不上输入时只保留最新帧并统计显示丢帧，不累积延迟。状态栏同时显示实际显示 fps 和目标 fps。全图 ROI 统计延迟到首帧提交后执行，并按固定回放帧缓存。调整窗宽窗位、停止或重新开始回放会自动清空相关缓存。
+本地回放针对当前固定的 2～3 帧使用预加载：开始回放时读取并解析一次原始图像，循环时复用内存帧；日志会记录成功预加载帧数和耗时。稳定的本地帧携带 `contentCacheKey`，主窗口最多缓存 4 张当前窗宽窗位下的 8-bit 显示图，`ImageView` 还会在 128 MiB 上限内缓存对应 `QPixmap`，避免无显卡或远程桌面环境反复做显示格式转换。未来 PCIe 动态帧默认不提供该键，因此不会按来源名误用旧缓存。首帧立即提交，后续显示节拍跟随用户设置的 1～120 fps；累计时间基准会自动补偿整数毫秒定时误差。处理速度跟不上输入时只保留最新帧并统计显示丢帧，不累积延迟。状态栏同时显示实际显示 fps 和目标 fps。全图 ROI 统计延迟到首帧提交后执行，并按稳定内容键缓存。调整窗宽窗位、停止或重新开始回放会自动清空相关缓存。
 
 图像列表缩略图直接从 16-bit 原始像素降采样到目标尺寸，不再先生成一张完整的 8-bit 大图，因此打开多张大图或首次回放时的界面阻塞更小。
 
@@ -293,6 +296,7 @@ Shift+ROI 按区域重算窗位窗宽
 图像列表右键导出 TiRaw、RAW16、PNG、TIFF、BMP 和 JPEG
 连续帧实际 FPS、错误和完成统计
 RS422 命令状态、超时和结构化 STATUS 处理
+图像采集会话状态、统一停止顺序和迟到帧隔离
 分级滚动日志、运行日志 Dock 和诊断文本导出
 串口参数、命令超时和最近目录持久化
 相同尺寸连续帧保持当前图像视图状态

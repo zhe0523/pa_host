@@ -122,11 +122,11 @@ ctest --output-on-failure
 
 当前覆盖协议解析、`.tiraw` 文件校验、像素读取、自动窗宽窗位、ROI 统计和显示映射。
 
-自动测试也覆盖 `AppSettings`、`AppLogService`、`PaDeviceController`、`ImageSession`、`ImageExportService`、`ReplayPresentationScheduler`、`FramePresentationController` 与本地连续回放源：包括配置持久化与边界、日志滚动和诊断导出、模拟 RS422 连接、结构化 STATUS、迟到响应隔离、命令超时与错误恢复、导出格式与写盘、60 fps 时间补偿、最新帧覆盖与丢帧统计、回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
+自动测试也覆盖 `AppSettings`、`AppLogService`、`PaDeviceController`、`ImageSession`、`ImageExportService`、`ReplayPresentationScheduler`、`FramePresentationController`、`ImageAcquisitionController` 与本地连续回放源：包括配置持久化与边界、日志滚动和诊断导出、模拟 RS422 连接、结构化 STATUS、迟到响应隔离、命令超时与错误恢复、导出格式与写盘、60 fps 时间补偿、最新帧覆盖与丢帧统计、采集会话启停、同步首帧、源销毁、迟到帧隔离、回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
 
 核心代码已经拆成 `pa_core`、`pa_transport` 和 `pa_host` 三个 CMake 目标。图像列表、
-导出编码、回放呈现和帧率计算也已分别迁移到 `ImageListPanel`、`ImageExportService`、
-`FramePresentationController` 和 `ReplayPresentationScheduler`。图像算法通过 `IImageAlgorithms` 接口调用，后续拿到
+导出编码、采集会话、回放呈现和帧率计算也已分别迁移到 `ImageListPanel`、`ImageExportService`、
+`ImageAcquisitionController`、`FramePresentationController` 和 `ReplayPresentationScheduler`。图像算法通过 `IImageAlgorithms` 接口调用，后续拿到
 旧软件算法源码时不需要修改主窗口。架构说明见 `doc/architecture.md`。
 
 ### 1. 先测图像查看
@@ -173,7 +173,7 @@ Shift+左键拖框会根据 ROI 重算窗位和窗宽
 文件 -> 回放 TiRaw 序列
 ```
 
-选择 2～3 张 `.tiraw` 后输入目标帧率。启动时会一次性预加载这些帧，日志显示成功帧数和预加载耗时，之后循环不再读取磁盘。预期首帧立即出现、图像连续刷新、状态栏同时显示实际和目标 fps，且相同尺寸帧不会让缩放或平移回到初始状态。显示节拍支持 1～120 fps，并补偿 Qt 5 整数毫秒定时误差。固定回放帧会复用 8-bit 显示图、受 128 MiB 限制的 `QPixmap` 和全图统计结果。通过“文件 -> 停止图像回放”停止，日志会记录输入帧数、显示帧数、显示丢帧和加载失败数。该链路是未来 PCIe 图像源的 UI 验证入口，当前不依赖硬件。
+选择 2～3 张 `.tiraw` 后输入目标帧率。启动时会一次性预加载这些帧，日志显示成功帧数和预加载耗时，之后循环不再读取磁盘。预期首帧立即出现、图像连续刷新、状态栏同时显示实际和目标 fps，且相同尺寸帧不会让缩放或平移回到初始状态。显示节拍支持 1～120 fps，并补偿 Qt 5 整数毫秒定时误差。固定回放帧通过稳定内容键复用 8-bit 显示图、受 128 MiB 限制的 `QPixmap` 和全图统计结果；未来动态帧不提供稳定键时自动禁用这些缓存。通过“文件 -> 停止图像回放”停止，日志会记录输入帧数、显示帧数、显示丢帧和加载失败数。该链路是未来 PCIe 图像源的 UI 验证入口，当前不依赖硬件。
 
 Qt 环境还没装好时，可以先用辅助脚本确认样例文件头：
 

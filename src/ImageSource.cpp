@@ -70,6 +70,7 @@ bool LocalReplaySource::start(QString* errorMessage) {
         ImageFrame frame;
         frame.image = std::move(image);
         frame.sourceName = QFileInfo(path).fileName();
+        frame.contentCacheKey = QFileInfo(path).absoluteFilePath();
         cachedFrames_.push_back(std::move(frame));
     }
     if (cachedFrames_.isEmpty()) {

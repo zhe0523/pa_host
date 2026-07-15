@@ -35,6 +35,14 @@ void FramePresentationController::stop() {
     scheduler_.reset();
 }
 
+void FramePresentationController::flushPendingFrame() {
+    if (!active_ || !framePending_) {
+        return;
+    }
+    presentationTimer_.stop();
+    presentPendingFrame();
+}
+
 bool FramePresentationController::isActive() const {
     return active_;
 }

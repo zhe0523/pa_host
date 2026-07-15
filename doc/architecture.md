@@ -13,15 +13,14 @@ pa_host（Qt 界面）
         +---- ImageExportService ---- 原始/显示格式编码
         +---- AppLogService --------- 分级日志、滚动文件和诊断导出
         +---- AppSettings ----------- 稳定配置键、默认值和范围
-        +---- FramePresentationController -- 最新帧、限速和统计
+        +---- ImageAcquisitionController -- 图像源会话、状态和统计
         |        |
-        |        +---- ReplayPresentationScheduler -- 纯时间计算
+        |        +---- IImageSource -------- LocalReplaySource / 未来 PCIe
+        |        +---- FramePresentationController -- 最新帧、限速和统计
+        |                 |
+        |                 +---- ReplayPresentationScheduler -- 纯时间计算
         |
-        +---- IImageSource ----------- LocalReplaySource
-        |        |                         |
-        |        +---- ImageFrame ---------+---- FramePresentationController
-        |                                      |
-        |                                      +---- ImageSession
+        +---- ImageFrame -> ImageSession
         |
         +---- IImageAlgorithms -------- BuiltinImageAlgorithms
         |                                  |
@@ -86,9 +85,16 @@ FramePresentationController
     管理呈现定时器、实际 FPS、显示计数和丢帧计数
     不读取文件、不渲染图像，可直接复用于未来 PCIe 图像源
 
+ImageAcquisitionController
+    连接任意 IImageSource 和 FramePresentationController
+    管理 Idle / Starting / Running / Stopping / Error 会话状态
+    统一源停止、呈现停止、最终统计和错误转发
+    通过会话代际忽略旧图像源的迟到回调
+    不解析 PCIe、TiRaw 或业务协议
+
 MainWindow
     打开文件对话框并维护 ImageSession
-    连接列表、呈现控制器、导出服务和 ImageView
+    连接列表、采集会话、导出服务和 ImageView
     连接日志显示、设备状态、显示缓存和状态标签
 ```
 
@@ -122,14 +128,15 @@ AppLogService
 ```text
 本地单文件 / 本地连续回放 / 未来 PCIe
               -> IImageSource（完整 ImageFrame）
+              -> ImageAcquisitionController（会话状态、停止和统计）
               -> FramePresentationController（最新帧与呈现节拍）
               -> ImageSession（当前帧与算法调用）
               -> MainWindow / ImageView
 ```
 
-`LocalReplaySource` 已接入文件菜单，可选择多个 `.tiraw` 并以 1~120 fps 循环回放。它只负责产生完整帧、错误和统计；UI 不直接读取回放文件。连续同尺寸帧保留当前视图变换。首帧使用可取消的成员定时器异步投递，停止、快速重启和回调内重启通过运行代际隔离，旧回调不能启动新一轮定时器。
+`LocalReplaySource` 已接入文件菜单，可选择多个 `.tiraw` 并以 1~120 fps 循环回放。它只负责产生完整帧、错误和统计；`ImageAcquisitionController` 负责源与呈现器的连接、启动、停止和汇总统计，窗口不再直接管理源信号。连续同尺寸帧保留当前视图变换。源和采集会话分别使用运行代际隔离快速重启后的旧回调。
 
-当前回放序列固定为 2～3 帧，因此 `LocalReplaySource` 在启动时一次性加载有效帧，后续循环通过 Qt 隐式共享复用像素内存。主窗口最多缓存 4 张窗宽窗位映射后的 `QImage`，`ImageView` 在 128 MiB 上限内缓存对应 `QPixmap`。`FramePresentationController` 只保留最新待显示帧，显示节拍跟随用户设置的 1～120 fps；其内部使用 `ReplayPresentationScheduler` 的累计纳秒时间基准补偿 Qt 5 整数毫秒定时器误差。来不及显示的中间帧计入显示丢帧，不进入无界队列。右侧全图 ROI 统计在首帧提交后延迟执行，最多每秒调度一次，并按固定帧路径缓存结果。上述按路径缓存只用于内容固定的本地回放，未来 PCIe 动态帧不能复用。
+当前回放序列固定为 2～3 帧，因此 `LocalReplaySource` 在启动时一次性加载有效帧，后续循环通过 Qt 隐式共享复用像素内存。内容固定的帧通过 `ImageFrame::contentCacheKey` 明确允许缓存；该键为空的动态帧不进入显示图、`QPixmap` 或全图统计缓存，也不会按来源名加入本地图像列表。主窗口最多缓存 4 张窗宽窗位映射后的 `QImage`，`ImageView` 的 `QPixmap` 缓存上限为 128 MiB。`FramePresentationController` 只保留最新待显示帧，显示节拍跟随用户设置的 1～120 fps；其内部使用 `ReplayPresentationScheduler` 的累计纳秒时间基准补偿 Qt 5 整数毫秒定时器误差。来不及显示的中间帧计入显示丢帧，不进入无界队列。右侧全图 ROI 统计在首帧提交后延迟执行，最多每秒调度一次，并按稳定内容键缓存结果。
 
 主窗口的普通图像列表保存文件路径和缩略图，不缓存每一项的完整 16-bit 像素。缩略图直接从原始像素降采样到目标尺寸，不构造完整显示图。用户切换列表项时重新加载对应文件，避免大量图像同时常驻造成内存快速增长。列表移除只删除 UI 项，不操作源文件。只有用户主动启动的小序列回放会在运行期间缓存所选原始帧。
 

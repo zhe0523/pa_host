@@ -11,6 +11,8 @@
 struct ImageFrame {
     TiRawImage image;
     QString sourceName;
+    // 非空表示内容在当前会话内稳定，可安全复用显示图和统计缓存。
+    QString contentCacheKey;
     quint64 sequence = 0;
     QDateTime receivedAt;
 };

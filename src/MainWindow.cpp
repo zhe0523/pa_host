@@ -2,7 +2,7 @@
 
 #include "AppLogService.h"
 #include "AppSettings.h"
-#include "FramePresentationController.h"
+#include "ImageAcquisitionController.h"
 #include "ImageExportService.h"
 #include "ImageListPanel.h"
 #include "PaDeviceController.h"
@@ -244,10 +244,10 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     }
     imageSession_ = std::make_unique<ImageSession>(std::move(algorithms), this);
     replaySource_ = new LocalReplaySource(this);
-    presentationController_ = new FramePresentationController(this);
+    acquisitionController_ = new ImageAcquisitionController(this);
     deviceController_ = new PaDeviceController(&serial_, this);
     deviceController_->setCommandTimeoutMs(settings_->commandTimeoutMs());
-    replayDisplayCache_.setMaxCost(4);
+    frameDisplayCache_.setMaxCost(4);
     setWindowTitle(QStringLiteral("PA Host"));
     setMinimumSize(1180, 820);
     resize(initialWindowSize());
@@ -323,31 +323,26 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     connect(imageListPanel_, &ImageListPanel::imageActivated, this, &MainWindow::handleImageListSelection);
     connect(imageListPanel_, &ImageListPanel::imagesRemoved, this, &MainWindow::handleImagesRemoved);
     connect(imageListPanel_, &ImageListPanel::exportRequested, this, &MainWindow::exportImage);
-    connect(replaySource_, &LocalReplaySource::frameReady,
-        presentationController_, &FramePresentationController::submitFrame);
-    connect(presentationController_, &FramePresentationController::framePresented,
+    connect(acquisitionController_, &ImageAcquisitionController::framePresented,
         this, &MainWindow::handlePresentedFrame);
-    connect(presentationController_, &FramePresentationController::fpsUpdated,
+    connect(acquisitionController_, &ImageAcquisitionController::fpsUpdated,
         this, [this](double actualFps, int targetFps) {
             fpsLabel_->setText(QStringLiteral("显示 fps: %1 / 目标 %2")
                                    .arg(actualFps, 0, 'f', 2)
                                    .arg(targetFps));
         });
-    connect(replaySource_, &LocalReplaySource::sourceError, this, [this](const QString& message) {
+    connect(acquisitionController_, &ImageAcquisitionController::errorOccurred,
+        this, [this](const QString& message) {
         logService_->warning(QStringLiteral("IMAGE"), message);
     });
-    connect(replaySource_, &LocalReplaySource::runningChanged, this, [this](bool running) {
-        if (!running) {
-            const ImageSourceStats stats = replaySource_->stats();
-            presentationController_->stop();
-            const FramePresentationStats presentationStats = presentationController_->stats();
-            logService_->info(QStringLiteral("IMAGE"),
-                QStringLiteral("图像回放停止: 输入 %1 帧，显示 %2 帧，显示丢帧 %3，加载失败 %4")
-                    .arg(stats.deliveredFrames)
-                    .arg(presentationStats.presentedFrames)
-                    .arg(presentationStats.droppedFrames)
-                    .arg(stats.failedFrames));
-        }
+    connect(acquisitionController_, &ImageAcquisitionController::sessionFinished,
+        this, [this](const ImageAcquisitionStats& stats) {
+        logService_->info(QStringLiteral("IMAGE"),
+            QStringLiteral("图像会话结束: 输入 %1 帧，显示 %2 帧，显示丢帧 %3，源失败 %4")
+                .arg(stats.source.deliveredFrames)
+                .arg(stats.presentation.presentedFrames)
+                .arg(stats.presentation.droppedFrames)
+                .arg(stats.source.failedFrames));
     });
     imageRefreshTimer_.setSingleShot(true);
     imageRefreshTimer_.setInterval(kStaticImageRefreshIntervalMs);
@@ -397,6 +392,7 @@ void MainWindow::openImage() {
         ImageFrame frame;
         frame.image = std::move(lastImage);
         frame.sourceName = QFileInfo(lastPath).fileName();
+        frame.contentCacheKey = QFileInfo(lastPath).absoluteFilePath();
         frame.receivedAt = QDateTime::currentDateTimeUtc();
         QString error;
         if (imageSession_->setFrame(frame, &error)) {
@@ -440,26 +436,21 @@ void MainWindow::startImageReplay() {
         imageListPanel_->addOrUpdateImage(path);
     }
 
-    clearReplayDisplayCaches();
-    replayFullImageStatsCache_.clear();
+    clearFrameDisplayCaches();
+    stableFrameStatsCache_.clear();
     imageInfoTimer_.invalidate();
     QString error;
-    QElapsedTimer preloadTimer;
-    preloadTimer.start();
-    if (!replaySource_->start(&error)) {
+    if (!acquisitionController_->start(replaySource_, fps, &error)) {
         imageView_->setPixmapCacheEnabled(false);
         QMessageBox::warning(this, QStringLiteral("回放失败"), error);
         return;
     }
-    const qint64 preloadMs = preloadTimer.elapsed();
-    const ImageSourceStats sourceStats = replaySource_->stats();
+    const ImageAcquisitionStats acquisitionStats = acquisitionController_->stats();
+    const qint64 preloadMs = acquisitionStats.sourceStartElapsedMs;
     const quint64 selectedFrames = static_cast<quint64>(paths.size());
-    const quint64 loadedFrames = selectedFrames > sourceStats.failedFrames
-        ? selectedFrames - sourceStats.failedFrames
+    const quint64 loadedFrames = selectedFrames > acquisitionStats.source.failedFrames
+        ? selectedFrames - acquisitionStats.source.failedFrames
         : 0;
-    imageView_->setPixmapCacheEnabled(true);
-    // 预加载完成后再启动计时，实际 FPS 不包含文件读取耗时。
-    presentationController_->start(fps);
     logService_->info(QStringLiteral("IMAGE"),
         QStringLiteral("开始图像回放: 预加载 %1/%2 帧，耗时 %3 ms，目标 %4 fps")
             .arg(loadedFrames)
@@ -471,15 +462,11 @@ void MainWindow::startImageReplay() {
 void MainWindow::stopImageReplay() {
     imageRefreshTimer_.stop();
     imageInfoRefreshTimer_.stop();
-    // 先停止呈现控制器，将尚未显示的最新帧记入丢帧统计。
-    presentationController_->stop();
+    acquisitionController_->stop();
     resetViewStateOnRefresh_ = false;
-    clearReplayDisplayCaches();
-    replayFullImageStatsCache_.clear();
+    clearFrameDisplayCaches();
+    stableFrameStatsCache_.clear();
     imageView_->setPixmapCacheEnabled(false);
-    if (replaySource_ != nullptr && replaySource_->isRunning()) {
-        replaySource_->stop();
-    }
 }
 
 void MainWindow::saveDisplayImage() {
@@ -608,7 +595,7 @@ void MainWindow::updateWindowLevel() {
         widthSpin_->setValue(widthSlider_->value());
     }
     if (!autoWindowCheck_->isChecked()) {
-        clearReplayDisplayCaches();
+        clearFrameDisplayCaches();
         scheduleImageRefresh(false);
     }
 }
@@ -764,7 +751,7 @@ QWidget* MainWindow::createWindowLevelPanel() {
     widthSpin_->setValue(4096);
 
     connect(autoWindowCheck_, &QCheckBox::toggled, this, [this]() {
-        clearReplayDisplayCaches();
+        clearFrameDisplayCaches();
         scheduleImageRefresh(false);
     });
     connect(centerSlider_, &QSlider::valueChanged, this, &MainWindow::updateWindowLevel);
@@ -1017,7 +1004,9 @@ void MainWindow::showCurrentSessionImage(const QString& source, bool resetViewSt
     }
 
     const TiRawImage& image = imageSession_->image();
-    clearReplayDisplayCaches();
+    clearFrameDisplayCaches();
+    stableFrameStatsCache_.clear();
+    imageView_->setPixmapCacheEnabled(!imageSession_->currentFrame().contentCacheKey.isEmpty());
     imageLabel_->setText(QStringLiteral("%1 x %2").arg(image.width()).arg(image.height()));
     fpsLabel_->setText(QStringLiteral("fps: 0.00"));
     pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
@@ -1045,10 +1034,12 @@ void MainWindow::clearCurrentImage() {
     fpsLabel_->setText(QStringLiteral("fps: 0.00"));
     pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
     roiInfoLabel_->setText(QStringLiteral("ROI 信息: --"));
+    clearFrameDisplayCaches();
+    stableFrameStatsCache_.clear();
 }
 
-void MainWindow::clearReplayDisplayCaches() {
-    replayDisplayCache_.clear();
+void MainWindow::clearFrameDisplayCaches() {
+    frameDisplayCache_.clear();
     if (imageView_ != nullptr) {
         imageView_->clearPixmapCache();
     }
@@ -1083,14 +1074,15 @@ void MainWindow::refreshImage(bool resetViewState) {
     }
 
     QImage display;
-    if (replaySource_->isRunning()) {
-        const QString cacheKey = imageSession_->image().path()
+    const QString contentCacheKey = imageSession_->currentFrame().contentCacheKey;
+    if (!contentCacheKey.isEmpty()) {
+        const QString cacheKey = contentCacheKey
             + QStringLiteral("\n%1\n%2").arg(centerSpin_->value()).arg(widthSpin_->value());
-        if (const QImage* cached = replayDisplayCache_.object(cacheKey)) {
+        if (const QImage* cached = frameDisplayCache_.object(cacheKey)) {
             display = *cached;
         } else {
             display = imageSession_->render(centerSpin_->value(), widthSpin_->value());
-            replayDisplayCache_.insert(cacheKey, new QImage(display));
+            frameDisplayCache_.insert(cacheKey, new QImage(display));
         }
     } else {
         display = imageSession_->render(centerSpin_->value(), widthSpin_->value());
@@ -1163,15 +1155,15 @@ void MainWindow::updateFullImageInfo() {
     }
 
     const TiRawImage& image = imageSession_->image();
-    if (replaySource_->isRunning()) {
-        const QString cacheKey = image.path();
-        auto cached = replayFullImageStatsCache_.constFind(cacheKey);
-        if (cached == replayFullImageStatsCache_.constEnd()) {
+    const QString contentCacheKey = imageSession_->currentFrame().contentCacheKey;
+    if (!contentCacheKey.isEmpty()) {
+        auto cached = stableFrameStatsCache_.constFind(contentCacheKey);
+        if (cached == stableFrameStatsCache_.constEnd()) {
             TiRawImage::RoiStats stats;
             if (!imageSession_->roiStats(QRect(0, 0, image.width(), image.height()), &stats)) {
                 return;
             }
-            cached = replayFullImageStatsCache_.insert(cacheKey, stats);
+            cached = stableFrameStatsCache_.insert(contentCacheKey, stats);
         }
         showRoiInfo(cached.value());
         return;
@@ -1283,7 +1275,7 @@ void MainWindow::applyWindowLevelFromRoi(const QRect& imageRect) {
         widthSpin_->setValue(windowLevel.width);
     }
 
-    clearReplayDisplayCaches();
+    clearFrameDisplayCaches();
     refreshImage(false);
 }
 
@@ -1299,9 +1291,13 @@ void MainWindow::handlePresentedFrame(const ImageFrame& frame) {
     }
 
     imageLabel_->setText(QStringLiteral("%1 x %2").arg(frame.image.width()).arg(frame.image.height()));
-    imageListPanel_->ensureThumbnail(frame.image.path(), frame.image);
-    imageListPanel_->setCurrentPath(frame.image.path());
-    // 呈现控制器已经完成限速和丢帧处理，这里只负责同步界面状态。
+    const bool stableContent = !frame.contentCacheKey.isEmpty();
+    imageView_->setPixmapCacheEnabled(stableContent);
+    if (stableContent && !frame.image.path().isEmpty()) {
+        imageListPanel_->ensureThumbnail(frame.image.path(), frame.image);
+        imageListPanel_->setCurrentPath(frame.image.path());
+    }
+    // 采集控制器已经完成会话隔离、限速和丢帧处理，这里只同步界面状态。
     imageRefreshTimer_.stop();
     const bool shouldResetView = resetViewStateOnRefresh_ || resetViewState;
     resetViewStateOnRefresh_ = false;
