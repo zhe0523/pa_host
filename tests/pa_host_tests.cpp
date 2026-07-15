@@ -7,6 +7,7 @@
 #include "ImageExportService.h"
 #include "ImageSession.h"
 #include "ImageSource.h"
+#include "ImageTransferWorkflowController.h"
 #include "MtfAnalysis.h"
 #include "PaDeviceController.h"
 #include "PaProtocol.h"
@@ -213,9 +214,11 @@ bool fuzzyEqual(double actual, double expected, double tolerance = 1e-6) {
 
 bool testProtocolCommands() {
     CHECK(PaProtocol::commandText(PaProtocol::Command::Ping) == QStringLiteral("PING"));
-    CHECK(PaProtocol::commandText(PaProtocol::Command::SendImage) == QStringLiteral("SEND_IMAGE"));
-    CHECK(PaProtocol::commandName(PaProtocol::Command::SendImage) == QStringLiteral("手动上图"));
-    CHECK(PaProtocol::commandNames().size() == 9);
+    CHECK(PaProtocol::commandText(PaProtocol::Command::SendSingle) == QStringLiteral("SEND_SINGLE"));
+    CHECK(PaProtocol::commandText(PaProtocol::Command::StartContinuous) == QStringLiteral("START_CONTINUOUS"));
+    CHECK(PaProtocol::commandText(PaProtocol::Command::StopTransfer) == QStringLiteral("STOP_TRANSFER"));
+    CHECK(PaProtocol::commandName(PaProtocol::Command::SendSingle) == QStringLiteral("手动上图"));
+    CHECK(PaProtocol::commandNames().size() == 10);
     return true;
 }
 
@@ -386,7 +389,8 @@ bool testPaDeviceController() {
     CHECK(controller.state() == PaDeviceState::Busy);
 
     transport.injectLine(QStringLiteral(
-        "OK STATUS pa=0x20 com=3 rst=4 wr_state=2 wr_end=1 corr_state=5 corr_end=0"));
+        "OK STATUS pa=0x20 com=3 rst=4 wr_state=2 wr_end=1 corr_state=5 corr_end=0 "
+        "model=PA-01 serial=SN0001 arm_version=1.2.3 fpga_version=4.5.6"));
     CHECK(controller.state() == PaDeviceState::Ready);
     CHECK(!controller.hasPendingCommand());
     CHECK(results.size() == 1);
@@ -397,6 +401,10 @@ bool testPaDeviceController() {
     CHECK(statuses.last().paFlags == 0x20);
     CHECK(statuses.last().writeState == 2);
     CHECK(statuses.last().correctionState == 5);
+    CHECK(statuses.last().model == QStringLiteral("PA-01"));
+    CHECK(statuses.last().serialNumber == QStringLiteral("SN0001"));
+    CHECK(statuses.last().armVersion == QStringLiteral("1.2.3"));
+    CHECK(statuses.last().fpgaVersion == QStringLiteral("4.5.6"));
 
     CHECK(controller.sendCommand(PaProtocol::Command::Ping, &error));
     transport.injectLine(QStringLiteral(
@@ -425,6 +433,25 @@ bool testPaDeviceController() {
     CHECK(controller.state() == PaDeviceState::Ready);
     CHECK(results.last().success);
 
+    // STOP_TRANSFER 会中止本地等待，写出后立即完成且不启动响应超时。
+    const int resultsBeforeImmediateStop = results.size();
+    CHECK(controller.sendCommand(PaProtocol::Command::StartContinuous, &error));
+    CHECK(controller.hasPendingCommand());
+    CHECK(controller.state() == PaDeviceState::Busy);
+    CHECK(controller.sendCommand(PaProtocol::Command::StopTransfer, &error));
+    CHECK(transport.sentLines.last() == QStringLiteral("STOP_TRANSFER"));
+    CHECK(!controller.hasPendingCommand());
+    CHECK(controller.state() == PaDeviceState::Ready);
+    CHECK(results.size() == resultsBeforeImmediateStop + 1);
+    CHECK(results.last().command == PaProtocol::Command::StopTransfer);
+    CHECK(results.last().success);
+    CHECK(results.last().detail.contains(QStringLiteral("无需等待响应")));
+    QEventLoop stoppedCommandTimeoutLoop;
+    QTimer::singleShot(40, &stoppedCommandTimeoutLoop, &QEventLoop::quit);
+    stoppedCommandTimeoutLoop.exec();
+    CHECK(controller.state() == PaDeviceState::Ready);
+    CHECK(results.size() == resultsBeforeImmediateStop + 1);
+
     CHECK(controller.sendCommand(PaProtocol::Command::Status, &error));
     transport.injectError(QStringLiteral("模拟链路故障"));
     CHECK(controller.state() == PaDeviceState::Error);
@@ -443,6 +470,117 @@ bool testPaDeviceController() {
     CHECK(error == QStringLiteral("模拟打开失败"));
     CHECK(failedController.state() == PaDeviceState::Error);
     CHECK(!errors.isEmpty());
+    return true;
+}
+
+bool testImageTransferWorkflowController() {
+    FakeLineTransport transport;
+    PaDeviceController deviceController(&transport);
+    ImageTransferWorkflowController workflow(&deviceController);
+    QStringList errors;
+    QObject::connect(&workflow, &ImageTransferWorkflowController::errorOccurred,
+        [&errors](const QString& message) {
+            errors.push_back(message);
+        });
+
+    QString error;
+    CHECK(workflow.state() == ImageTransferState::Disconnected);
+    CHECK(workflow.mode() == ImageTransferMode::Manual);
+    CHECK(!workflow.canSelectMode());
+    CHECK(!workflow.canStart());
+    CHECK(!workflow.canStop());
+
+    CHECK(deviceController.connectDevice(QStringLiteral("COM_IMAGE"), 115200, &error));
+    deviceController.setCommandTimeoutMs(15);
+    CHECK(workflow.state() == ImageTransferState::Ready);
+    CHECK(workflow.canSelectMode());
+    CHECK(workflow.canStart());
+
+    const int commandsBeforeModeChange = transport.sentLines.size();
+    CHECK(workflow.setMode(ImageTransferMode::Continuous, &error));
+    CHECK(workflow.mode() == ImageTransferMode::Continuous);
+    CHECK(transport.sentLines.size() == commandsBeforeModeChange);
+
+    CHECK(workflow.startTransfer(&error));
+    CHECK(workflow.state() == ImageTransferState::StartingContinuous);
+    CHECK(transport.sentLines.last() == QStringLiteral("START_CONTINUOUS"));
+    CHECK(!workflow.canSelectMode());
+    CHECK(!workflow.canStart());
+    CHECK(workflow.canStop());
+    const int commandsBeforePendingStop = transport.sentLines.size();
+    CHECK(workflow.stopTransfer(&error));
+    CHECK(transport.sentLines.size() == commandsBeforePendingStop + 1);
+    CHECK(transport.sentLines.last() == QStringLiteral("STOP_TRANSFER"));
+    CHECK(workflow.state() == ImageTransferState::Ready);
+    CHECK(workflow.canSelectMode());
+    CHECK(workflow.canStart());
+    CHECK(!workflow.canStop());
+    CHECK(workflow.mode() == ImageTransferMode::Continuous);
+
+    // 原开始命令的本地超时已经取消，停止后不能再次把界面切回错误状态。
+    QEventLoop stoppedCommandTimeoutLoop;
+    QTimer::singleShot(40, &stoppedCommandTimeoutLoop, &QEventLoop::quit);
+    stoppedCommandTimeoutLoop.exec();
+    CHECK(workflow.state() == ImageTransferState::Ready);
+    CHECK(workflow.canStart());
+
+    CHECK(workflow.startTransfer(&error));
+    transport.injectLine(QStringLiteral("OK START_CONTINUOUS"));
+    CHECK(workflow.state() == ImageTransferState::ContinuousRunning);
+    CHECK(workflow.canStop());
+    CHECK(!workflow.setMode(ImageTransferMode::Manual, &error));
+    CHECK(workflow.stopTransfer(&error));
+    CHECK(transport.sentLines.last() == QStringLiteral("STOP_TRANSFER"));
+    CHECK(workflow.state() == ImageTransferState::Ready);
+    CHECK(workflow.canSelectMode());
+    CHECK(workflow.canStart());
+    CHECK(!workflow.canStop());
+
+    CHECK(deviceController.sendCommand(PaProtocol::Command::StartContinuous, &error));
+    transport.injectLine(QStringLiteral("OK START_CONTINUOUS"));
+    CHECK(workflow.state() == ImageTransferState::ContinuousRunning);
+    CHECK(workflow.canStop());
+    CHECK(deviceController.sendCommand(PaProtocol::Command::StopTransfer, &error));
+    CHECK(workflow.state() == ImageTransferState::Ready);
+    CHECK(workflow.canStart());
+
+    CHECK(deviceController.sendCommand(PaProtocol::Command::StartContinuous, &error));
+    transport.injectLine(QStringLiteral("ERR TIMEOUT"));
+    CHECK(workflow.state() == ImageTransferState::Error);
+    CHECK(workflow.canStop());
+    CHECK(workflow.stopTransfer(&error));
+    CHECK(workflow.state() == ImageTransferState::Ready);
+
+    CHECK(workflow.setMode(ImageTransferMode::Manual, &error));
+    CHECK(workflow.startTransfer(&error));
+    CHECK(workflow.state() == ImageTransferState::StartingSingle);
+    CHECK(transport.sentLines.last() == QStringLiteral("SEND_SINGLE"));
+    CHECK(workflow.canStop());
+    const int commandsBeforeSingleStop = transport.sentLines.size();
+    CHECK(workflow.stopTransfer(&error));
+    CHECK(transport.sentLines.size() == commandsBeforeSingleStop + 1);
+    CHECK(transport.sentLines.last() == QStringLiteral("STOP_TRANSFER"));
+    CHECK(workflow.state() == ImageTransferState::Ready);
+    CHECK(workflow.canSelectMode());
+    CHECK(workflow.canStart());
+    CHECK(!workflow.canStop());
+
+    CHECK(workflow.startTransfer(&error));
+    transport.injectLine(QStringLiteral("OK SEND_SINGLE"));
+    CHECK(workflow.state() == ImageTransferState::Ready);
+
+    CHECK(workflow.startTransfer(&error));
+    transport.injectLine(QStringLiteral("ERR BUSY"));
+    CHECK(workflow.state() == ImageTransferState::Error);
+    CHECK(!workflow.canStart());
+    CHECK(workflow.canStop());
+    CHECK(workflow.stopTransfer(&error));
+    CHECK(workflow.state() == ImageTransferState::Ready);
+    CHECK(!errors.isEmpty());
+
+    deviceController.disconnectDevice();
+    CHECK(workflow.state() == ImageTransferState::Disconnected);
+    CHECK(!workflow.canStart());
     return true;
 }
 
@@ -987,6 +1125,7 @@ int main(int argc, char* argv[]) {
         {"app_settings", testAppSettings},
         {"app_log_service", testAppLogService},
         {"pa_device_controller", testPaDeviceController},
+        {"image_transfer_workflow_controller", testImageTransferWorkflowController},
         {"tiraw_parsing_and_roi", testTirawParsingAndRoi},
         {"auto_window_level", testAutoWindowLevel},
         {"image_algorithm_boundary", testImageAlgorithmBoundary},

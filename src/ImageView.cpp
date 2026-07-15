@@ -184,7 +184,8 @@ bool ImageView::savePng(const QString& path) {
     if (image_.isNull()) {
         return false;
     }
-    return image_.save(path, "PNG");
+    const QImage output = image_.transformed(imageTransform(1.0), Qt::FastTransformation);
+    return output.save(path, "PNG");
 }
 
 void ImageView::mousePressEvent(QMouseEvent* event) {
@@ -236,16 +237,22 @@ void ImageView::mouseReleaseEvent(QMouseEvent* event) {
         selectionMode_ = SelectionMode::None;
         setDragMode(QGraphicsView::ScrollHandDrag);
         const QPoint imagePoint = imagePointAt(event->pos());
+        bool validSelection = false;
         if (imagePoint.x() >= 0) {
             const QRect imageRect(roiStart_, imagePoint);
             const QRect normalized = imageRect.normalized();
             if (normalized.width() > 1 && normalized.height() > 1) {
+                validSelection = true;
                 if (mode == SelectionMode::Analysis) {
                     emit analysisRoiSelected(normalized);
                 } else if (mode == SelectionMode::WindowLevel) {
                     emit windowLevelRoiSelected(normalized);
                 }
             }
+        }
+        if (!validSelection) {
+            clearRoiOverlay();
+            emit roiCleared();
         }
         event->accept();
         return;
@@ -314,11 +321,15 @@ void ImageView::clearRoiOverlay() {
     selectionMode_ = SelectionMode::None;
 }
 
+QTransform ImageView::imageTransform(qreal zoom) const {
+    QTransform transform;
+    transform.scale(zoom * (flipH_ ? -1.0 : 1.0), zoom * (flipV_ ? -1.0 : 1.0));
+    transform.rotate(rotation_);
+    return transform;
+}
+
 void ImageView::applyTransform() {
-    QTransform t;
-    t.scale(zoom_ * (flipH_ ? -1.0 : 1.0), zoom_ * (flipV_ ? -1.0 : 1.0));
-    t.rotate(rotation_);
-    setTransform(t);
+    setTransform(imageTransform(zoom_));
     updateZoomLabel();
 }
 

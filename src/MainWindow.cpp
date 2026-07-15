@@ -5,6 +5,7 @@
 #include "ImageAcquisitionController.h"
 #include "ImageExportService.h"
 #include "ImageListPanel.h"
+#include "ImageTransferWorkflowController.h"
 #include "PaDeviceController.h"
 
 #include <QAction>
@@ -102,6 +103,30 @@ QString defaultImageDirectory(const AppSettings& settings) {
 
     const QString picturesDirectory = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
     return picturesDirectory.isEmpty() ? QDir::homePath() : picturesDirectory;
+}
+
+QString imageTransferStateText(
+    ImageTransferMode mode,
+    ImageTransferState state) {
+    switch (state) {
+    case ImageTransferState::Disconnected:
+        return QStringLiteral("工作模式: 未连接");
+    case ImageTransferState::Ready:
+        return mode == ImageTransferMode::Manual
+            ? QStringLiteral("工作模式: 手动就绪")
+            : QStringLiteral("工作模式: 持续就绪");
+    case ImageTransferState::StartingSingle:
+        return QStringLiteral("工作模式: 单帧上图中");
+    case ImageTransferState::StartingContinuous:
+        return QStringLiteral("工作模式: 正在启动持续上图");
+    case ImageTransferState::ContinuousRunning:
+        return QStringLiteral("工作模式: 持续上图中");
+    case ImageTransferState::Stopping:
+        return QStringLiteral("工作模式: 正在停止上图");
+    case ImageTransferState::Error:
+        return QStringLiteral("工作模式: 上图控制错误");
+    }
+    return QStringLiteral("工作模式: 未知");
 }
 
 QString normalizedImagePath(const QString& path) {
@@ -247,6 +272,7 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     acquisitionController_ = new ImageAcquisitionController(this);
     deviceController_ = new PaDeviceController(&serial_, this);
     deviceController_->setCommandTimeoutMs(settings_->commandTimeoutMs());
+    imageTransferController_ = new ImageTransferWorkflowController(deviceController_, this);
     frameDisplayCache_.setMaxCost(4);
     setWindowTitle(QStringLiteral("PA Host"));
     setMinimumSize(1180, 820);
@@ -295,7 +321,31 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     connect(deviceController_, &PaDeviceController::stateChanged,
         this, &MainWindow::updateDeviceState);
     connect(deviceController_, &PaDeviceController::deviceStatusChanged,
-        this, &MainWindow::updateDeviceStatus);
+        this, [this](const PaDeviceStatus& status) {
+            if (!status.model.isEmpty()) {
+                modelLabel_->setText(QStringLiteral("型号: %1").arg(status.model));
+            }
+            if (!status.serialNumber.isEmpty()) {
+                serialLabel_->setText(QStringLiteral("序列号: %1").arg(status.serialNumber));
+            }
+            if (!status.armVersion.isEmpty()) {
+                armProgramVersion_ = status.armVersion;
+            }
+            if (!status.fpgaVersion.isEmpty()) {
+                fpgaVersion_ = status.fpgaVersion;
+            }
+            logService_->debug(QStringLiteral("RS422"),
+                QStringLiteral("设备状态: pa=%1 com=%2 rst=%3 wr=%4/%5 corr=%6/%7 arm=%8 fpga=%9")
+                    .arg(status.paFlags)
+                    .arg(status.communicationFlags)
+                    .arg(status.resetFlags)
+                    .arg(status.writeState)
+                    .arg(status.writeEnd)
+                    .arg(status.correctionState)
+                    .arg(status.correctionEnd)
+                    .arg(status.armVersion.isEmpty() ? QStringLiteral("--") : status.armVersion)
+                    .arg(status.fpgaVersion.isEmpty() ? QStringLiteral("--") : status.fpgaVersion));
+        });
     connect(deviceController_, &PaDeviceController::lineTransmitted, this, [this](const QString& line) {
         logService_->info(QStringLiteral("RS422"), QStringLiteral("TX: %1").arg(line));
     });
@@ -313,13 +363,22 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
             logService_->log(success ? AppLogLevel::Info : AppLogLevel::Warning,
                 QStringLiteral("RS422"), message);
         });
+    connect(imageTransferController_, &ImageTransferWorkflowController::controlsChanged,
+        this, &MainWindow::updateImageTransferControls);
+    connect(imageTransferController_, &ImageTransferWorkflowController::errorOccurred,
+        this, [this](const QString& message) {
+            logService_->warning(QStringLiteral("IMAGE_CONTROL"), message);
+        });
     connect(imageView_, &ImageView::zoomChanged, this, [this](int percent) {
         progressLabel_->setText(QStringLiteral("缩放: %1%").arg(percent));
     });
     connect(imageView_, &ImageView::pixelHovered, this, &MainWindow::updatePixelInfo);
     connect(imageView_, &ImageView::analysisRoiSelected, this, &MainWindow::handleAnalysisRoi);
     connect(imageView_, &ImageView::windowLevelRoiSelected, this, &MainWindow::applyWindowLevelFromRoi);
-    connect(imageView_, &ImageView::roiCleared, this, &MainWindow::updateFullImageInfo);
+    connect(imageView_, &ImageView::roiCleared, this, [this]() {
+        activeRoi_ = {};
+        updateFullImageInfo();
+    });
     connect(imageListPanel_, &ImageListPanel::imageActivated, this, &MainWindow::handleImageListSelection);
     connect(imageListPanel_, &ImageListPanel::imagesRemoved, this, &MainWindow::handleImagesRemoved);
     connect(imageListPanel_, &ImageListPanel::exportRequested, this, &MainWindow::exportImage);
@@ -327,9 +386,13 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
         this, &MainWindow::handlePresentedFrame);
     connect(acquisitionController_, &ImageAcquisitionController::fpsUpdated,
         this, [this](double actualFps, int targetFps) {
-            fpsLabel_->setText(QStringLiteral("显示 fps: %1 / 目标 %2")
+            fpsLabel_->setText(QStringLiteral("显示 FPS: %1 / 目标: %2")
                                    .arg(actualFps, 0, 'f', 2)
                                    .arg(targetFps));
+        });
+    connect(acquisitionController_, &ImageAcquisitionController::stateChanged,
+        this, [this]() {
+            updateImageUiState();
         });
     connect(acquisitionController_, &ImageAcquisitionController::errorOccurred,
         this, [this](const QString& message) {
@@ -337,6 +400,8 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     });
     connect(acquisitionController_, &ImageAcquisitionController::sessionFinished,
         this, [this](const ImageAcquisitionStats& stats) {
+        fpsLabel_->setText(QStringLiteral("显示 FPS: --"));
+        updateImageUiState();
         logService_->info(QStringLiteral("IMAGE"),
             QStringLiteral("图像会话结束: 输入 %1 帧，显示 %2 帧，显示丢帧 %3，源失败 %4")
                 .arg(stats.source.deliveredFrames)
@@ -351,14 +416,15 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
         resetViewStateOnRefresh_ = false;
     });
     imageInfoRefreshTimer_.setSingleShot(true);
-    connect(&imageInfoRefreshTimer_, &QTimer::timeout, this, &MainWindow::updateFullImageInfo);
+    connect(&imageInfoRefreshTimer_, &QTimer::timeout, this, &MainWindow::updateCurrentImageInfo);
     updateDeviceState(deviceController_->state());
+    updateImageTransferControls();
+    updateImageUiState();
     logService_->info(QStringLiteral("SYSTEM"),
         QStringLiteral("应用启动，日志目录: %1").arg(logService_->logDirectory()));
 }
 
 void MainWindow::openImage() {
-    stopImageReplay();
     const QString initialDirectory = defaultImageDirectory(*settings_);
     const QStringList paths = QFileDialog::getOpenFileNames(
         this,
@@ -369,6 +435,7 @@ void MainWindow::openImage() {
         return;
     }
 
+    stopImageReplay();
     settings_->setLastImageDirectory(QFileInfo(paths.first()).absolutePath());
 
     TiRawImage lastImage;
@@ -431,10 +498,6 @@ void MainWindow::startImageReplay() {
     replaySource_->setPlaylist(paths);
     replaySource_->setIntervalMs(std::max(1, 1000 / fps));
     replaySource_->setLoopEnabled(true);
-    imageListPanel_->clearImages();
-    for (const QString& path : paths) {
-        imageListPanel_->addOrUpdateImage(path);
-    }
 
     clearFrameDisplayCaches();
     stableFrameStatsCache_.clear();
@@ -442,9 +505,16 @@ void MainWindow::startImageReplay() {
     QString error;
     if (!acquisitionController_->start(replaySource_, fps, &error)) {
         imageView_->setPixmapCacheEnabled(false);
+        updateImageUiState();
         QMessageBox::warning(this, QStringLiteral("回放失败"), error);
         return;
     }
+    imageListPanel_->clearImages();
+    for (const QString& path : paths) {
+        imageListPanel_->addOrUpdateImage(path);
+    }
+    fpsLabel_->setText(QStringLiteral("显示 FPS: 0.00 / 目标: %1").arg(fps));
+    updateImageUiState();
     const ImageAcquisitionStats acquisitionStats = acquisitionController_->stats();
     const qint64 preloadMs = acquisitionStats.sourceStartElapsedMs;
     const quint64 selectedFrames = static_cast<quint64>(paths.size());
@@ -467,6 +537,10 @@ void MainWindow::stopImageReplay() {
     clearFrameDisplayCaches();
     stableFrameStatsCache_.clear();
     imageView_->setPixmapCacheEnabled(false);
+    if (fpsLabel_ != nullptr) {
+        fpsLabel_->setText(QStringLiteral("显示 FPS: --"));
+    }
+    updateImageUiState();
 }
 
 void MainWindow::saveDisplayImage() {
@@ -621,6 +695,7 @@ void MainWindow::toggleImageMaximized() {
     if (imageView_ != nullptr && imageView_->hasImage()) {
         imageView_->fitToWindow();
     }
+    updateImageUiState();
 }
 
 QWidget* MainWindow::createTopBar() {
@@ -630,36 +705,46 @@ QWidget* MainWindow::createTopBar() {
     layout->setContentsMargins(10, 8, 10, 8);
     layout->setSpacing(8);
 
-    auto* idleButton = new QPushButton(QStringLiteral("Idle"), bar);
-    auto* continuousButton = new QPushButton(QStringLiteral("Continuous"), bar);
-    manualImageButton_ = new QPushButton(QStringLiteral("手动上图"), bar);
-    statusButton_ = new QPushButton(QStringLiteral("停止上图"), bar);
+    idleModeButton_ = new QPushButton(QStringLiteral("Idle"), bar);
+    continuousModeButton_ = new QPushButton(QStringLiteral("Continuous"), bar);
+    startImageButton_ = new QPushButton(QStringLiteral("手动上图"), bar);
+    stopImageButton_ = new QPushButton(QStringLiteral("停止上图"), bar);
 
-    idleButton->setCheckable(true);
-    idleButton->setChecked(true);
-    continuousButton->setCheckable(true);
-    idleButton->setProperty("role", "mode");
-    continuousButton->setProperty("role", "mode");
-    manualImageButton_->setProperty("role", "primary");
-    statusButton_->setProperty("role", "stop");
+    idleModeButton_->setCheckable(true);
+    idleModeButton_->setChecked(true);
+    continuousModeButton_->setCheckable(true);
+    idleModeButton_->setProperty("role", "mode");
+    continuousModeButton_->setProperty("role", "mode");
+    startImageButton_->setProperty("role", "primary");
+    stopImageButton_->setProperty("role", "stop");
 
     auto* modeGroup = new QButtonGroup(bar);
     modeGroup->setExclusive(true);
-    modeGroup->addButton(idleButton);
-    modeGroup->addButton(continuousButton);
+    modeGroup->addButton(idleModeButton_);
+    modeGroup->addButton(continuousModeButton_);
 
-    connect(manualImageButton_, &QPushButton::clicked, this, [this]() {
-        sendCommand(PaProtocol::Command::SendImage);
+    connect(idleModeButton_, &QPushButton::clicked, this, [this]() {
+        QString error;
+        imageTransferController_->setMode(ImageTransferMode::Manual, &error);
     });
-    connect(statusButton_, &QPushButton::clicked, this, [this]() {
-        sendCommand(PaProtocol::Command::Status);
+    connect(continuousModeButton_, &QPushButton::clicked, this, [this]() {
+        QString error;
+        imageTransferController_->setMode(ImageTransferMode::Continuous, &error);
+    });
+    connect(startImageButton_, &QPushButton::clicked, this, [this]() {
+        QString error;
+        imageTransferController_->startTransfer(&error);
+    });
+    connect(stopImageButton_, &QPushButton::clicked, this, [this]() {
+        QString error;
+        imageTransferController_->stopTransfer(&error);
     });
 
-    layout->addWidget(idleButton);
-    layout->addWidget(continuousButton);
+    layout->addWidget(idleModeButton_);
+    layout->addWidget(continuousModeButton_);
     layout->addSpacing(18);
-    layout->addWidget(manualImageButton_);
-    layout->addWidget(statusButton_);
+    layout->addWidget(startImageButton_);
+    layout->addWidget(stopImageButton_);
     layout->addStretch(1);
 
     return bar;
@@ -675,8 +760,10 @@ QWidget* MainWindow::createRightPanel() {
     auto* layout = new QVBoxLayout(panel);
     layout->setContentsMargins(6, 0, 0, 0);
     layout->setSpacing(6);
-    layout->addWidget(createImageOpsPanel());
-    layout->addWidget(createWindowLevelPanel());
+    imageOpsPanel_ = createImageOpsPanel();
+    windowLevelPanel_ = createWindowLevelPanel();
+    layout->addWidget(imageOpsPanel_);
+    layout->addWidget(windowLevelPanel_);
     layout->addWidget(createImageInfoPanel());
     layout->addStretch(1);
 
@@ -751,6 +838,7 @@ QWidget* MainWindow::createWindowLevelPanel() {
     widthSpin_->setValue(4096);
 
     connect(autoWindowCheck_, &QCheckBox::toggled, this, [this]() {
+        updateWindowLevelControlState();
         clearFrameDisplayCaches();
         scheduleImageRefresh(false);
     });
@@ -779,7 +867,7 @@ QWidget* MainWindow::createImageInfoPanel() {
     pixelInfoLabel_ = new QLabel(QStringLiteral("像素值: --"), group);
     pixelInfoLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
-    roiInfoLabel_ = new QLabel(QStringLiteral("ROI 信息: Ctrl+左键分析，Shift+左键重算窗宽窗位"), group);
+    roiInfoLabel_ = new QLabel(QStringLiteral("ROI 信息: --"), group);
     roiInfoLabel_->setWordWrap(true);
     roiInfoLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
@@ -812,15 +900,15 @@ void MainWindow::createMenus() {
     auto* fileMenu = menuBar()->addMenu(QStringLiteral("文件"));
     auto* openAction = fileMenu->addAction(QStringLiteral("打开 TiRaw 图像"));
     auto* replayAction = fileMenu->addAction(QStringLiteral("回放 TiRaw 序列"));
-    auto* stopReplayAction = fileMenu->addAction(QStringLiteral("停止图像回放"));
-    auto* saveAction = fileMenu->addAction(QStringLiteral("保存显示图像"));
+    stopReplayAction_ = fileMenu->addAction(QStringLiteral("停止图像回放"));
+    saveDisplayAction_ = fileMenu->addAction(QStringLiteral("保存显示图像"));
     fileMenu->addSeparator();
     auto* quitAction = fileMenu->addAction(QStringLiteral("退出"));
 
     connect(openAction, &QAction::triggered, this, &MainWindow::openImage);
     connect(replayAction, &QAction::triggered, this, &MainWindow::startImageReplay);
-    connect(stopReplayAction, &QAction::triggered, this, &MainWindow::stopImageReplay);
-    connect(saveAction, &QAction::triggered, this, &MainWindow::saveDisplayImage);
+    connect(stopReplayAction_, &QAction::triggered, this, &MainWindow::stopImageReplay);
+    connect(saveDisplayAction_, &QAction::triggered, this, &MainWindow::saveDisplayImage);
     connect(quitAction, &QAction::triggered, this, &QWidget::close);
 
     auto* serialMenu = menuBar()->addMenu(QStringLiteral("RS422"));
@@ -866,8 +954,9 @@ void MainWindow::createMenus() {
         {PaProtocol::Command::MakeOffset, "生成 Offset"},
         {PaProtocol::Command::MakeGain, "生成 Gain"},
         {PaProtocol::Command::StartCorrection, "启动校正"},
-        {PaProtocol::Command::SendImage, "手动上图"},
-        {PaProtocol::Command::Quit, "退出 ARM"},
+        {PaProtocol::Command::SendSingle, "单帧上图"},
+        {PaProtocol::Command::StartContinuous, "开始持续上图"},
+        {PaProtocol::Command::StopTransfer, "停止上图"},
     };
     for (const MenuCommand& item : commands) {
         QAction* action = commandMenu->addAction(QString::fromUtf8(item.text), this, [this, item]() {
@@ -882,21 +971,42 @@ void MainWindow::createMenus() {
     imageMaximizeAction_->setShortcut(QKeySequence(Qt::Key_F11));
     connect(imageMaximizeAction_, &QAction::triggered, this, &MainWindow::toggleImageMaximized);
 
-    menuBar()->addMenu(QStringLiteral("校准"));
     auto* toolsMenu = menuBar()->addMenu(QStringLiteral("工具"));
     toolsMenu->addAction(QStringLiteral("命令超时设置"), this, &MainWindow::configureCommandTimeout);
     toolsMenu->addAction(QStringLiteral("导出诊断信息"), this, &MainWindow::exportDiagnostics);
-    menuBar()->addMenu(QStringLiteral("帮助"));
+    auto* helpMenu = menuBar()->addMenu(QStringLiteral("帮助"));
+    helpMenu->addAction(QStringLiteral("关于 PA Host"), this, &MainWindow::showAbout);
+}
+
+void MainWindow::showAbout() {
+    const bool connected = deviceController_ != nullptr && deviceController_->isConnected();
+    const QString unavailableVersion = connected
+        ? QStringLiteral("未获取（设备未返回）")
+        : QStringLiteral("未获取（设备未连接）");
+
+    QMessageBox dialog(this);
+    dialog.setWindowTitle(QStringLiteral("关于 PA Host"));
+    dialog.setIcon(QMessageBox::Information);
+    dialog.setTextFormat(Qt::PlainText);
+    dialog.setText(QStringLiteral("PA Host"));
+    dialog.setInformativeText(
+        QStringLiteral("软件版本: %1\n编译时间: %2\nARM 程序版本: %3\nFPGA 版本: %4")
+            .arg(QCoreApplication::applicationVersion(),
+                QStringLiteral(PA_HOST_BUILD_TIME),
+                armProgramVersion_.isEmpty() ? unavailableVersion : armProgramVersion_,
+                fpgaVersion_.isEmpty() ? unavailableVersion : fpgaVersion_));
+    dialog.setStandardButtons(QMessageBox::Ok);
+    dialog.exec();
 }
 
 void MainWindow::createStatusBar() {
-    modelLabel_ = new QLabel(QStringLiteral("新型号 PA 专用"));
-    serialLabel_ = new QLabel(QStringLiteral("SN: --"));
+    modelLabel_ = new QLabel(QStringLiteral("型号: PA 专用"));
+    serialLabel_ = new QLabel(QStringLiteral("序列号: --"));
     connectionLabel_ = new QLabel(QStringLiteral("RS422: 未连接"));
     modeLabel_ = new QLabel(QStringLiteral("工作模式: Idle"));
-    imageLabel_ = new QLabel(QStringLiteral("当前图像: --"));
+    imageLabel_ = new QLabel(QStringLiteral("图像尺寸: --"));
     progressLabel_ = new QLabel(QStringLiteral("缩放: --"));
-    fpsLabel_ = new QLabel(QStringLiteral("fps: 0.00"));
+    fpsLabel_ = new QLabel(QStringLiteral("显示 FPS: --"));
 
     const auto configureStatusLabel = [](QLabel* label) {
         label->setObjectName(QStringLiteral("statusLabel"));
@@ -925,8 +1035,14 @@ void MainWindow::handleImageListSelection(const QString& path) {
     }
 
     stopImageReplay();
+    const QString displayedPath = imageSession_->hasImage()
+        ? imageSession_->image().path()
+        : QString();
     QString error;
     if (!imageSession_->loadFile(path, &error)) {
+        if (!displayedPath.isEmpty()) {
+            imageListPanel_->setCurrentPath(displayedPath);
+        }
         QMessageBox::warning(this, QStringLiteral("打开失败"), error);
         logService_->error(QStringLiteral("IMAGE"),
             QStringLiteral("切换图像失败: %1, %2").arg(path, error));
@@ -952,12 +1068,18 @@ void MainWindow::exportImage(const QString& sourcePath, const QString& formatId)
         return;
     }
 
-    if (!imageSession_->hasImage() || normalizedImagePath(imageSession_->image().path()) != sourcePath) {
+    TiRawImage exportImage;
+    const TiRawImage* imageToExport = nullptr;
+    if (imageSession_->hasImage()
+        && normalizedImagePath(imageSession_->image().path()) == normalizedImagePath(sourcePath)) {
+        imageToExport = &imageSession_->image();
+    } else {
         QString loadError;
-        if (!imageSession_->loadFile(sourcePath, &loadError)) {
+        if (!exportImage.load(sourcePath, &loadError)) {
             QMessageBox::warning(this, QStringLiteral("导出失败"), loadError);
             return;
         }
+        imageToExport = &exportImage;
     }
 
     QString exportDirectory = settings_->lastExportDirectory();
@@ -984,7 +1106,7 @@ void MainWindow::exportImage(const QString& sourcePath, const QString& formatId)
 
     QString error;
     if (!ImageExportService::exportImage(
-            imageSession_->image(),
+            *imageToExport,
             centerSpin_->value(),
             widthSpin_->value(),
             formatId,
@@ -1007,9 +1129,13 @@ void MainWindow::showCurrentSessionImage(const QString& source, bool resetViewSt
     clearFrameDisplayCaches();
     stableFrameStatsCache_.clear();
     imageView_->setPixmapCacheEnabled(!imageSession_->currentFrame().contentCacheKey.isEmpty());
-    imageLabel_->setText(QStringLiteral("%1 x %2").arg(image.width()).arg(image.height()));
-    fpsLabel_->setText(QStringLiteral("fps: 0.00"));
+    imageLabel_->setText(QStringLiteral("图像尺寸: %1 x %2")
+                             .arg(image.width())
+                             .arg(image.height()));
+    fpsLabel_->setText(QStringLiteral("显示 FPS: --"));
     pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
+    updateImageUiState();
+    activeRoi_ = {};
     updateFullImageInfo();
     const WindowLevelResult autoWindow = imageSession_->autoWindowLevel();
     logService_->info(QStringLiteral("IMAGE"),
@@ -1029,13 +1155,15 @@ void MainWindow::clearCurrentImage() {
     imageInfoRefreshTimer_.stop();
     imageSession_->clear();
     imageView_->setImage(QImage());
-    imageLabel_->setText(QStringLiteral("当前图像: --"));
+    imageLabel_->setText(QStringLiteral("图像尺寸: --"));
     progressLabel_->setText(QStringLiteral("缩放: --"));
-    fpsLabel_->setText(QStringLiteral("fps: 0.00"));
+    fpsLabel_->setText(QStringLiteral("显示 FPS: --"));
     pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
     roiInfoLabel_->setText(QStringLiteral("ROI 信息: --"));
+    activeRoi_ = {};
     clearFrameDisplayCaches();
     stableFrameStatsCache_.clear();
+    updateImageUiState();
 }
 
 void MainWindow::clearFrameDisplayCaches() {
@@ -1146,6 +1274,14 @@ void MainWindow::updateRoiInfo(const QRect& imageRect) {
     showRoiInfo(stats);
 }
 
+void MainWindow::updateCurrentImageInfo() {
+    if (activeRoi_.isValid() && !activeRoi_.isEmpty()) {
+        updateRoiInfo(activeRoi_);
+        return;
+    }
+    updateFullImageInfo();
+}
+
 void MainWindow::updateFullImageInfo() {
     if (!imageSession_->hasImage()) {
         if (roiInfoLabel_ != nullptr) {
@@ -1172,6 +1308,7 @@ void MainWindow::updateFullImageInfo() {
 }
 
 void MainWindow::handleAnalysisRoi(const QRect& imageRect) {
+    activeRoi_ = imageRect;
     updateRoiInfo(imageRect);
 
     TiRawImage::RoiStats stats;
@@ -1249,6 +1386,7 @@ void MainWindow::handleAnalysisRoi(const QRect& imageRect) {
 }
 
 void MainWindow::applyWindowLevelFromRoi(const QRect& imageRect) {
+    activeRoi_ = imageRect;
     updateRoiInfo(imageRect);
 
     TiRawImage::RoiStats stats;
@@ -1275,6 +1413,7 @@ void MainWindow::applyWindowLevelFromRoi(const QRect& imageRect) {
         widthSpin_->setValue(windowLevel.width);
     }
 
+    updateWindowLevelControlState();
     clearFrameDisplayCaches();
     refreshImage(false);
 }
@@ -1289,8 +1428,14 @@ void MainWindow::handlePresentedFrame(const ImageFrame& frame) {
             QStringLiteral("接收图像帧失败: %1").arg(error));
         return;
     }
+    if (resetViewState) {
+        activeRoi_ = {};
+    }
 
-    imageLabel_->setText(QStringLiteral("%1 x %2").arg(frame.image.width()).arg(frame.image.height()));
+    imageLabel_->setText(QStringLiteral("图像尺寸: %1 x %2")
+                             .arg(frame.image.width())
+                             .arg(frame.image.height()));
+    updateImageUiState();
     const bool stableContent = !frame.contentCacheKey.isEmpty();
     imageView_->setPixmapCacheEnabled(stableContent);
     if (stableContent && !frame.image.path().isEmpty()) {
@@ -1309,6 +1454,63 @@ void MainWindow::handlePresentedFrame(const ImageFrame& frame) {
     }
 }
 
+void MainWindow::updateImageUiState() {
+    const bool hasImage = imageSession_ != nullptr && imageSession_->hasImage();
+    if (imageOpsPanel_ != nullptr) {
+        imageOpsPanel_->setEnabled(hasImage);
+    }
+    if (windowLevelPanel_ != nullptr) {
+        windowLevelPanel_->setEnabled(hasImage);
+    }
+    if (saveDisplayAction_ != nullptr) {
+        saveDisplayAction_->setEnabled(hasImage);
+    }
+    if (imageMaximizeAction_ != nullptr) {
+        imageMaximizeAction_->setEnabled(hasImage || imageMaximized_);
+    }
+    if (stopReplayAction_ != nullptr) {
+        stopReplayAction_->setEnabled(
+            acquisitionController_ != nullptr && acquisitionController_->isActive());
+    }
+    updateWindowLevelControlState();
+}
+
+void MainWindow::updateWindowLevelControlState() {
+    const bool manualEnabled = imageSession_ != nullptr
+        && imageSession_->hasImage()
+        && autoWindowCheck_ != nullptr
+        && !autoWindowCheck_->isChecked();
+    if (centerSlider_ != nullptr) {
+        centerSlider_->setEnabled(manualEnabled);
+    }
+    if (widthSlider_ != nullptr) {
+        widthSlider_->setEnabled(manualEnabled);
+    }
+    if (centerSpin_ != nullptr) {
+        centerSpin_->setEnabled(manualEnabled);
+    }
+    if (widthSpin_ != nullptr) {
+        widthSpin_->setEnabled(manualEnabled);
+    }
+}
+
+void MainWindow::updateImageTransferControls() {
+    if (imageTransferController_ == nullptr) {
+        return;
+    }
+    const ImageTransferMode mode = imageTransferController_->mode();
+    idleModeButton_->setChecked(mode == ImageTransferMode::Manual);
+    continuousModeButton_->setChecked(mode == ImageTransferMode::Continuous);
+    idleModeButton_->setEnabled(imageTransferController_->canSelectMode());
+    continuousModeButton_->setEnabled(imageTransferController_->canSelectMode());
+    startImageButton_->setText(mode == ImageTransferMode::Manual
+            ? QStringLiteral("手动上图")
+            : QStringLiteral("开始上图"));
+    startImageButton_->setEnabled(imageTransferController_->canStart());
+    stopImageButton_->setEnabled(imageTransferController_->canStop());
+    modeLabel_->setText(imageTransferStateText(mode, imageTransferController_->state()));
+}
+
 void MainWindow::updateDeviceState(PaDeviceState state) {
     const bool connected = deviceController_->isConnected();
     const bool commandEnabled = connected && state != PaDeviceState::Busy;
@@ -1321,11 +1523,13 @@ void MainWindow::updateDeviceState(PaDeviceState state) {
     for (QAction* action : deviceCommandActions_) {
         action->setEnabled(commandEnabled);
     }
-    manualImageButton_->setEnabled(commandEnabled);
-    statusButton_->setEnabled(commandEnabled);
 
     switch (state) {
     case PaDeviceState::Disconnected:
+        armProgramVersion_.clear();
+        fpgaVersion_.clear();
+        modelLabel_->setText(QStringLiteral("型号: PA 专用"));
+        serialLabel_->setText(QStringLiteral("序列号: --"));
         connectionLabel_->setText(QStringLiteral("RS422: 未连接"));
         break;
     case PaDeviceState::Ready:
@@ -1338,15 +1542,4 @@ void MainWindow::updateDeviceState(PaDeviceState state) {
         connectionLabel_->setText(QStringLiteral("RS422: 错误"));
         break;
     }
-}
-
-void MainWindow::updateDeviceStatus(const PaDeviceStatus& status) {
-    if (!status.valid) {
-        return;
-    }
-    modeLabel_->setText(QStringLiteral("wr:%1/%2 corr:%3/%4")
-                            .arg(status.writeState)
-                            .arg(status.writeEnd)
-                            .arg(status.correctionState)
-                            .arg(status.correctionEnd));
 }

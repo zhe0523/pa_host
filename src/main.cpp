@@ -115,6 +115,21 @@ QPushButton[role="stop"]:hover {
     background: #27883a;
 }
 
+QPushButton:disabled,
+QPushButton[role="mode"]:disabled,
+QPushButton[role="mode"]:checked:disabled,
+QPushButton[role="primary"]:disabled,
+QPushButton[role="stop"]:disabled {
+    background: #e3e7ec;
+    border-color: #c7ced7;
+    color: #8a949f;
+}
+
+QMenu::item:disabled {
+    background: transparent;
+    color: #9aa3ad;
+}
+
 QLineEdit,
 QComboBox,
 QSpinBox,
@@ -147,6 +162,15 @@ QListWidget#imageList::item:selected {
     background: #f2fff5;
     border-color: #2f9e44;
     color: #163d22;
+}
+
+QLineEdit:disabled,
+QComboBox:disabled,
+QSpinBox:disabled,
+QTextEdit:disabled {
+    background: #edf0f3;
+    border-color: #d4d9df;
+    color: #919aa4;
 }
 
 QSlider::groove:horizontal {

@@ -6,6 +6,7 @@
 #include "TiRawImage.h"
 
 class QAction;
+class QPushButton;
 class QListWidget;
 class QListWidgetItem;
 
@@ -30,9 +31,11 @@ signals:
 
 private:
     QListWidgetItem* findItem(const QString& path) const;
+    void updateRemovalControls();
     void removeSelectedImages();
     void showContextMenu(const QPoint& position);
 
     QListWidget* imageList_ = nullptr;
+    QPushButton* removeButton_ = nullptr;
     QAction* removeAction_ = nullptr;
 };

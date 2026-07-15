@@ -122,11 +122,11 @@ ctest --output-on-failure
 
 当前覆盖协议解析、`.tiraw` 文件校验、像素读取、自动窗宽窗位、ROI 统计和显示映射。
 
-自动测试也覆盖 `AppSettings`、`AppLogService`、`PaDeviceController`、`ImageSession`、`ImageExportService`、`ReplayPresentationScheduler`、`FramePresentationController`、`ImageAcquisitionController` 与本地连续回放源：包括配置持久化与边界、日志滚动和诊断导出、模拟 RS422 连接、结构化 STATUS、迟到响应隔离、命令超时与错误恢复、导出格式与写盘、60 fps 时间补偿、最新帧覆盖与丢帧统计、采集会话启停、同步首帧、源销毁、迟到帧隔离、回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
+自动测试也覆盖 `AppSettings`、`AppLogService`、`PaDeviceController`、`ImageTransferWorkflowController`、`ImageSession`、`ImageExportService`、`ReplayPresentationScheduler`、`FramePresentationController`、`ImageAcquisitionController` 与本地连续回放源：包括配置持久化与边界、日志滚动和诊断导出、模拟 RS422 连接、结构化 STATUS、迟到响应隔离、命令超时与错误恢复、手动/持续模式、单帧、持续启动和停止命令、导出格式与写盘、60 fps 时间补偿、最新帧覆盖与丢帧统计、采集会话启停、同步首帧、源销毁、迟到帧隔离、回放帧序号、非循环播放结束、快速停止重启以及坏文件跳过统计。
 
 核心代码已经拆成 `pa_core`、`pa_transport` 和 `pa_host` 三个 CMake 目标。图像列表、
-导出编码、采集会话、回放呈现和帧率计算也已分别迁移到 `ImageListPanel`、`ImageExportService`、
-`ImageAcquisitionController`、`FramePresentationController` 和 `ReplayPresentationScheduler`。图像算法通过 `IImageAlgorithms` 接口调用，后续拿到
+导出编码、客户上图工作流、采集会话、回放呈现和帧率计算也已分别迁移到 `ImageListPanel`、`ImageExportService`、
+`ImageTransferWorkflowController`、`ImageAcquisitionController`、`FramePresentationController` 和 `ReplayPresentationScheduler`。图像算法通过 `IImageAlgorithms` 接口调用，后续拿到
 旧软件算法源码时不需要修改主窗口。架构说明见 `doc/architecture.md`。
 
 ### 1. 先测图像查看
@@ -195,6 +195,21 @@ python3 tools/check_tiraw.py /home/zhe/app/windows/tidetector/CollectImage/20260
 4. 点击“心跳”，日志应收到 OK PONG。
 5. 点击“读取状态”，日志应收到 OK STATUS ...
 ```
+
+顶部正式业务按钮测试：
+
+```text
+1. 选择 Idle，不应发送任何命令；点击“手动上图”后发送 SEND_SINGLE。
+2. 选择 Continuous，不应发送任何命令；点击“开始上图”后发送 START_CONTINUOUS。
+3. 持续上图成功后模式按钮和开始按钮禁用，“停止上图”可用。
+4. 点击“停止上图”后发送 STOP_TRANSFER，不注入任何回包，界面应立即恢复可操作状态。
+5. 停止后仍保持 Continuous 选择，可以立即再次点击开始。
+6. 手动上图等待响应时“停止上图”仍可点击；点击后立即取消本地等待和超时，不等待单帧响应。
+7. 未连接和命令不可执行时对应按钮必须明显变灰；任何保持蓝色或绿色的按钮都必须能响应点击。
+```
+
+当前没有正式 PCIe 图像源，因此这些按钮只能验证 RS422 业务状态和命令，尚不能让主界面
+收到真实 FPGA 图像。`PA/FPGA` 菜单和运行日志属于研发维护入口，不是客户正常操作流程。
 
 未连接时 PA/FPGA 菜单和顶部“手动上图”等命令按钮不可用。命令发送后状态栏显示
 “RS422: 执行中”，同一时间不允许重复发送；5 秒内没有收到可识别响应会记录超时并

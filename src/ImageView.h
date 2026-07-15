@@ -8,6 +8,7 @@
 #include <QImage>
 #include <QPoint>
 #include <QRect>
+#include <QTransform>
 
 /*
  * 图像显示控件。
@@ -55,6 +56,7 @@ protected:
 
 private:
     QPoint imagePointAt(const QPoint& viewPoint) const;
+    QTransform imageTransform(qreal zoom) const;
     void clearRoiOverlay();
     void applyTransform();
     void updateZoomLabel();

@@ -13,6 +13,10 @@ pa_host（Qt 界面）
         +---- ImageExportService ---- 原始/显示格式编码
         +---- AppLogService --------- 分级日志、滚动文件和诊断导出
         +---- AppSettings ----------- 稳定配置键、默认值和范围
+        +---- ImageTransferWorkflowController -- 客户上图模式和命令状态
+        |        |
+        |        +---- PaDeviceController -> PaProtocol -> ILineTransport
+        |
         +---- ImageAcquisitionController -- 图像源会话、状态和统计
         |        |
         |        +---- IImageSource -------- LocalReplaySource / 未来 PCIe
@@ -92,9 +96,17 @@ ImageAcquisitionController
     通过会话代际忽略旧图像源的迟到回调
     不解析 PCIe、TiRaw 或业务协议
 
+ImageTransferWorkflowController
+    管理 Manual / Continuous 客户模式，模式选择不发送命令
+    将开始操作映射为 SEND_SINGLE 或 START_CONTINUOUS
+    将停止操作映射为单帧和持续模式共用的 STOP_TRANSFER
+    停止写出成功后立即恢复 Ready，不等待设备响应
+    持续运行时锁定模式和开始入口，保留停止入口
+    不解析 ASCII 文本，不读取或显示图像
+
 MainWindow
     打开文件对话框并维护 ImageSession
-    连接列表、采集会话、导出服务和 ImageView
+    连接列表、上图工作流、采集会话、导出服务和 ImageView
     连接日志显示、设备状态、显示缓存和状态标签
 ```
 
@@ -174,7 +186,10 @@ RS422 只负责控制命令和状态，当前依赖方向为：
 
 ```text
 MainWindow
-    -> PaDeviceController
+    +-> ImageTransferWorkflowController（正式客户按钮）
+    |       -> PaDeviceController
+    |
+    +-> PaDeviceController（研发原始命令入口）
         -> PaProtocol
         -> ILineTransport
             -> SerialClient -> ARM
@@ -183,14 +198,22 @@ MainWindow
 职责分配：
 
 ```text
-MainWindow          连接界面操作和结构化设备状态，不解析 ASCII 文本
+MainWindow          连接客户按钮、研发菜单和状态显示，不解析 ASCII 文本
+ImageTransferWorkflowController  管理手动/持续模式、开始/停止和按钮可用状态
 PaDeviceController  管理连接状态、单条在途命令、5 秒超时和 STATUS 数据
 PaProtocol          定义命令文本并将响应行拆成 keyword 和 key=value
 ILineTransport      定义打开、关闭、发送行和接收行，不依赖 QSerialPort
 SerialClient        实现 Linux/Windows 串口参数、收发缓存和完整行切分
 ```
 
-控制器同一时间只允许一条命令在途，防止响应无法对应命令。命令执行期间界面禁用其他 PA/FPGA 命令；响应成功后恢复 `Ready`，设备返回 `ERR`、响应超时或传输错误后进入 `Error`。串口仍打开时允许从错误状态直接重试，断开连接会取消在途命令。
+控制器同一时间只允许一条普通命令在途，防止响应无法对应命令。命令执行期间界面禁用其他 PA/FPGA 命令；响应成功后恢复 `Ready`，设备返回 `ERR`、响应超时或传输错误后进入 `Error`。串口仍打开时允许从错误状态直接重试，断开连接会取消在途命令。`STOP_TRANSFER` 是例外：它会取消当前本地等待和计时，写出成功后立即完成，不建立新的在途命令。
+
+正式客户流程不会直接选择协议命令。Idle 和 Continuous 只修改本地模式，客户点击开始后
+才分别发送 `SEND_SINGLE` 或 `START_CONTINUOUS`。持续发送由 FPGA 维持，直到客户点击
+停止。`STOP_TRANSFER` 写出后不等待回包，上位机立即取消原命令等待和超时计时，并恢复
+客户按钮。V0 没有事务号，停止后迟到的旧响应与后续命令仍可能混淆；该可靠性问题已记录
+在协议草案中，基础功能阶段不以等待停止回包的方式阻塞界面。原始 `PA/FPGA` 菜单和运行日志只作为当前研发、
+维护入口，发布阶段应由维护模式控制可见性。
 
 自动测试使用内存模拟的 `ILineTransport`，不需要串口硬件即可验证连接、状态解析、迟到响应隔离、重复命令拦截、超时、错误恢复和打开失败。
 

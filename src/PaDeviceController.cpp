@@ -110,6 +110,9 @@ bool PaDeviceController::sendCommand(
         setState(PaDeviceState::Disconnected);
         return rejectOperation(QStringLiteral("串口未连接"), errorMessage);
     }
+    if (command == PaProtocol::Command::StopTransfer) {
+        return sendImmediateCommand(command, errorMessage);
+    }
     if (pendingCommand_.has_value()) {
         return rejectOperation(QStringLiteral("上一条命令尚未完成"), errorMessage);
     }
@@ -136,6 +139,34 @@ bool PaDeviceController::sendCommand(
     if (pendingCommand_.has_value()) {
         commandTimer_.start(commandTimeoutMs_);
     }
+    return true;
+}
+
+bool PaDeviceController::sendImmediateCommand(
+    PaProtocol::Command command,
+    QString* errorMessage) {
+    // STOP_TRANSFER 无需响应，并会取消本地对上一条上图命令的等待。
+    commandTimer_.stop();
+    pendingCommand_.reset();
+    setState(PaDeviceState::Busy);
+
+    const QString line = PaProtocol::commandText(command);
+    QString transportError;
+    if (!transport_->sendLine(line, &transportError)) {
+        const QString message = transportError.isEmpty()
+            ? QStringLiteral("即时命令发送失败")
+            : transportError;
+        setState(PaDeviceState::Error);
+        emit errorOccurred(message);
+        if (errorMessage != nullptr) {
+            *errorMessage = message;
+        }
+        return false;
+    }
+
+    emit lineTransmitted(line);
+    setState(PaDeviceState::Ready);
+    emit commandFinished(command, true, QStringLiteral("命令已发送，无需等待响应"));
     return true;
 }
 
@@ -275,6 +306,10 @@ bool PaDeviceController::parseDeviceStatus(
 
     PaDeviceStatus parsed;
     parsed.rawLine = response.rawLine;
+    parsed.model = response.kv.value(QStringLiteral("model")).trimmed();
+    parsed.serialNumber = response.kv.value(QStringLiteral("serial")).trimmed();
+    parsed.armVersion = response.kv.value(QStringLiteral("arm_version")).trimmed();
+    parsed.fpgaVersion = response.kv.value(QStringLiteral("fpga_version")).trimmed();
     const bool valid = readUnsignedField(response.kv, QStringLiteral("pa"), &parsed.paFlags)
         && readUnsignedField(response.kv, QStringLiteral("com"), &parsed.communicationFlags)
         && readUnsignedField(response.kv, QStringLiteral("rst"), &parsed.resetFlags)

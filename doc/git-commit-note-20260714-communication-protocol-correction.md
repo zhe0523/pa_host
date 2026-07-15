@@ -104,7 +104,8 @@ ACK、DONE 和长任务结束规则不够严格
 HELLO 缺少连接随机标识
 10 Gbps 光口传输 30 fps RAW12 的带宽余量较小
 图像帧头版本、flags、CRC 和时间基准未完全定义
-SEND_IMAGE、START_CORR 和 QUIT 语义不够明确
+当时的 SEND_IMAGE、START_CORR 和 QUIT 语义不够明确；后续 SEND_IMAGE 已拆为
+SEND_SINGLE、START_CONTINUOUS 和 STOP_TRANSFER，QUIT 已从上位机协议和界面移除
 ```
 
 正式方案建议使用 `host_session_id + seq` 防止重复执行，并由上位机生成

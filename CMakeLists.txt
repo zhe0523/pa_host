@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 
 project(pa_host VERSION 0.1.0 LANGUAGES CXX)
 
+string(TIMESTAMP PA_HOST_BUILD_TIME "%Y-%m-%d %H:%M:%S")
+
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
@@ -32,6 +34,8 @@ add_library(pa_core STATIC
     src/ILineTransport.h
     src/ImageExportService.cpp
     src/ImageExportService.h
+    src/ImageTransferWorkflowController.cpp
+    src/ImageTransferWorkflowController.h
     src/ImageAlgorithms.cpp
     src/ImageAlgorithms.h
     src/ImageSession.cpp
@@ -83,7 +87,10 @@ target_link_libraries(pa_host PRIVATE
     pa_core
     Qt${QT_VERSION_MAJOR}::Widgets
 )
-target_compile_definitions(pa_host PRIVATE PA_HOST_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(pa_host PRIVATE
+    PA_HOST_VERSION="${PROJECT_VERSION}"
+    PA_HOST_BUILD_TIME="${PA_HOST_BUILD_TIME}"
+)
 
 # A MinGW executable needs the runtime DLLs from the compiler that produced it.
 # Keep them beside the executable so direct launches do not depend on PATH.

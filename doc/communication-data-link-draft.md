@@ -2,9 +2,9 @@
 
 文档状态：讨论稿，不代表 ARM、FPGA 或驱动已经实现。
 
-草案版本：0.3（问题记录版）
+草案版本：0.4（基础上图工作流版）
 
-日期：2026-07-14
+日期：2026-07-15
 
 当前阶段决策：先完成上位机基础功能和可替换的软件框架，暂不实现 V1 可靠性机制。本文件
 继续记录目标设计和已知风险；正式 ARM/FPGA 联调及产品化前，必须重新评审并关闭第 16
@@ -71,17 +71,22 @@ MAKE_OFFSET
 MAKE_GAIN
 CONFIG_TEMPLATE
 START_CORR
-SEND_IMAGE
-QUIT
+SEND_SINGLE
+START_CONTINUOUS
+STOP_TRANSFER
 ```
 
 响应示例：
 
 ```text
 OK PONG
-OK STATUS pa=0x00000000 com=0x00000000 rst=0x00000000 wr_state=0 wr_end=0 corr_state=0 corr_end=0
+OK STATUS pa=0x00000000 com=0x00000000 rst=0x00000000 wr_state=0 wr_end=0 corr_state=0 corr_end=0 model=PA-01 serial=SN0001 arm_version=1.0.0 fpga_version=1.0.0
 ERR UNKNOWN
 ```
+
+`model`、`serial`、`arm_version` 和 `fpga_version` 是向后兼容的可选字段，供上位机状态栏
+和“关于”界面显示。旧 ARM 程序未返回时，上位机继续接受其余 STATUS 字段，并将对应信息
+显示为占位值。字段值不得包含空格；正式 V1 协议冻结时再统一格式和握手返回位置。
 
 该协议可以继续用于前期 RS422 收发和 ARM 命令验证，但存在以下限制：
 
@@ -93,6 +98,29 @@ ACK 和任务最终完成没有区分
 所有命令只能共用一套响应超时
 没有行长度上限和内容校验约定
 ```
+
+#### 3.1.1 当前上图命令语义
+
+主界面模式选择只改变上位机本地模式，不向 ARM/FPGA 发送命令。客户必须再次点击开始
+按钮确认操作：
+
+```text
+Idle + 手动上图        -> SEND_SINGLE
+Continuous + 开始上图  -> START_CONTINUOUS
+任一上图过程 + 停止上图 -> STOP_TRANSFER
+```
+
+`SEND_SINGLE` 要求 FPGA 发送一张图像后停止。`START_CONTINUOUS` 要求 FPGA 自动持续发送
+图像，不需要上位机逐帧触发；持续发送直到收到 `STOP_TRANSFER`。该停止命令也用于取消
+尚未完成的单帧上图。模式选择、开始和停止必须是三个独立动作，选择 Continuous 不能
+直接启动传图。
+
+`STOP_TRANSFER` 是无需响应的即时控制命令。即使开始命令仍在等待响应，上位机也立即取消
+该命令的本地等待和超时计时并写出停止命令；写出成功后界面立即恢复 Ready，不等待
+ARM/FPGA 回包。不可执行的按钮必须禁用并显示为灰色，不能保留可点击外观。
+
+V0 没有事务号，因此停止后迟到的旧响应可能与紧接着发送的新命令混淆。基础功能阶段接受
+这一边界，正式联调前必须通过 V1 事务号、明确的响应匹配和迟到响应处理规则解决。
 
 ### 3.2 V0.5：不修改 ARM 的过渡方案
 
@@ -310,8 +338,9 @@ EVT type=EXPOSURE_DONE event_seq=... exposure_id=...
 | `MAKE_OFFSET` | 长任务 | `ACK job_id` 后 `EVT JOB_*` | 禁止盲重试 |
 | `MAKE_GAIN` | 长任务 | `ACK job_id` 后 `EVT JOB_*` | 禁止盲重试 |
 | `START_CORR` | 有状态操作 | `ACK` 或 `DONE` | 禁止盲重试 |
-| `SEND_IMAGE` | 采集触发，含义待确认 | 待 ARM 确认 | 禁止盲重试 |
-| `QUIT` | 危险操作 | `ACK` | 禁止，界面二次确认 |
+| `SEND_SINGLE` | 单帧上图 | `DONE` | 禁止盲重试 |
+| `START_CONTINUOUS` | 开始持续上图 | `DONE` | 禁止盲重试 |
+| `STOP_TRANSFER` | 停止当前单帧或持续上图 | 无 | 可以人工重试，不自动重试 |
 
 长任务至少需要三个时间概念：
 
@@ -357,20 +386,20 @@ FPGA -> MSI/MSI-X -> Linux 驱动 -> read/poll 返回 -> 采集线程
 
 ## 6. 控制与图像采集的关联
 
-正式采集应引入 `session_id`。建议流程：
+正式采集应引入 `acquisition_id`。建议流程：
 
 ```text
 1. 上位机完成 HELLO 和 STATUS，确认设备 Online
-2. 上位机发送 START_ACQ，包含采集模式和必要参数
-3. ARM 接受后返回 session_id
-4. FPGA/PCIe 输出的每帧携带相同 session_id
-5. 上位机只接收当前会话的帧，旧会话帧计入 stale_session_frames
-6. 上位机发送 STOP_ACQ
+2. 上位机先启动 PCIe 接收，再生成 acquisition_id
+3. 单帧发送 SEND_SINGLE，持续发送 START_CONTINUOUS，并携带 acquisition_id
+4. FPGA/PCIe 输出的每帧携带相同 acquisition_id
+5. 上位机只接收当前采集的帧，旧采集帧计入 stale_acquisition_frames
+6. 需要停止单帧或持续传输时发送 STOP_TRANSFER
 7. ARM/FPGA 停止后返回最终帧数和错误统计
 ```
 
-`START_ACQ`、`STOP_ACQ` 是目标命令名称，当前 V0 尚未实现。`SEND_IMAGE` 是否等价于单帧
-采集、开始发送或上传已有图像，必须由 ARM 负责人明确后才能映射。
+V0 暂不携带 `acquisition_id`，只验证三条基础命令。V1 冻结时再定义该字段、命令响应与
+首帧/末帧的跨链路时序。
 
 ## 7. PCIe 图像帧草案
 
@@ -395,7 +424,7 @@ DMA 每次读取边界不等于图像帧边界
 | `0x08` | 2 | `version` | 帧协议版本，建议从 1 开始 |
 | `0x0A` | 2 | `header_bytes` | 当前建议 80 |
 | `0x0C` | 4 | `flags` | 校正、触发、错误等标志 |
-| `0x10` | 8 | `session_id` | 与控制面采集会话对应 |
+| `0x10` | 8 | `acquisition_id` | 与控制面采集操作对应 |
 | `0x18` | 8 | `frame_seq` | 会话内单调递增帧号 |
 | `0x20` | 8 | `device_timestamp_us` | 设备时间戳及时间基准待确认 |
 | `0x28` | 4 | `width` | 有效像素宽度 |
@@ -433,7 +462,7 @@ DMA 每次读取边界不等于图像帧边界
 3. 校验 width、height、stride、payload_bytes 是否在允许范围
 4. 等待完整 payload
 5. 校验 payload CRC
-6. 检查 session_id 和 frame_seq
+6. 检查 acquisition_id 和 frame_seq
 7. 转换为内部 ImageFrame
 8. 将错误和统计上报，继续搜索下一帧
 ```
@@ -441,7 +470,7 @@ DMA 每次读取边界不等于图像帧边界
 所有长度计算必须使用防溢出的 64 位运算，并设置由设备型号决定的最大宽、高、行跨度和
 载荷上限。坏头或坏 CRC 不得造成无限缓存或越界读取。
 
-`frame_seq` 回绕、设备重启后清零和 session 切换规则由 FPGA 确认。上位机不能简单使用
+`frame_seq` 回绕、设备重启后清零和 acquisition 切换规则由 FPGA 确认。上位机不能简单使用
 无符号减法把乱序或重启误算成巨量丢帧。
 
 ## 8. 上位机采集管线
@@ -471,7 +500,7 @@ DMA 缓冲区归还驱动前，消费者不得继续引用其内存
 当前 `ImageFrame` 只有图像、来源名、序号和主机接收时间。正式接入时建议增加：
 
 ```text
-session_id
+acquisition_id
 device_timestamp
 pixel_format
 frame_flags
@@ -491,7 +520,7 @@ sync_errors                 帧同步失败次数
 header_errors               非法帧头次数
 payload_crc_errors          载荷 CRC 错误帧数
 protocol_dropped_frames     根据 frame_seq 判断的链路丢帧
-stale_session_frames        旧采集会话帧数
+stale_acquisition_frames    旧采集操作帧数
 acquisition_queue_drops     采集处理队列丢帧
 record_queue_drops          原始记录丢帧
 preview_dropped_frames      预览层主动覆盖帧数
@@ -527,7 +556,7 @@ EOF/设备移除：停止采集并报告，不在紧循环中反复读取
 ## 11. 安全和操作约束
 
 ```text
-QUIT、复位、写模板和校准命令需要二次确认或受控流程
+复位、写模板和校准命令需要二次确认或受控流程
 有副作用的命令禁止自动盲重试
 日志不得记录图像像素和大块二进制载荷
 协议错误日志应限制频率，防止故障时耗尽磁盘
@@ -578,7 +607,7 @@ PING 正常响应上限和推荐心跳周期
 需要主动上报的业务事件及其字段
 各命令是立即完成还是长任务
 各长任务正常耗时、取消方式和最终状态来源
-SEND_IMAGE 的准确业务含义
+SEND_SINGLE、START_CONTINUOUS 的响应时点，以及 STOP_TRANSFER 的设备侧停流时序
 ARM 重启标识 boot_id 如何生成
 是否支持行级 CRC16
 ```
@@ -588,7 +617,7 @@ ARM 重启标识 boot_id 如何生成
 ```text
 图像有效宽高、位深、像素格式和行填充
 RAW12 是否打包以及准确位序
-帧头、帧号、时间戳、session_id 和 CRC 能否提供
+帧头、帧号、时间戳、acquisition_id 和 CRC 能否提供
 帧号回绕和复位规则
 控制命令到首帧、末帧的时序
 异常帧或光口错误如何上报
@@ -624,9 +653,9 @@ RAW12 是否打包以及准确位序
 1. V1 的 ACK/DONE/ERR/EVT 字段和状态转换
 2. 心跳周期、超时、失败阈值和失联动作
 3. ARM 需要主动上报的业务事件清单
-4. SEND_IMAGE 的准确含义及正式采集命令
+4. 三条上图命令与首帧、末帧的时序
 5. 哪些命令属于长任务以及完成条件
-6. 图像帧是否携带 session_id、frame_seq、长度和 CRC
+6. 图像帧是否携带 acquisition_id、frame_seq、长度和 CRC
 7. PCIe 输出使用 MONO16、MONO12_IN16 还是打包 RAW12
 8. 原始记录和实时预览的丢帧策略
 ```
@@ -642,15 +671,16 @@ RAW12 是否打包以及准确位序
 | 优先级 | 已知问题 | 主要风险 | 当前处理决定 |
 | --- | --- | --- | --- |
 | 严重 | 事务号只匹配响应，尚未定义重复请求去重 | ACK 丢失后重发可能让校准、采集等命令执行两次 | V1 定义 `host_session_id + seq` 去重和结果缓存 |
-| 严重 | `session_id` 的生成方和跨链路时序不明确 | PCIe 首帧可能早于 RS422 响应，导致图像归属不确定 | 改为上位机生成 `acquisition_id`，接收就绪后再发启动命令 |
+| 严重 | `acquisition_id` 的跨链路携带和时序尚未冻结 | PCIe 首帧可能早于 RS422 响应，导致图像归属不确定 | 上位机生成 `acquisition_id`，接收就绪后再发启动命令 |
 | 严重 | 旧 PCIe 参考文档的像素数、载荷长度和 RAW12 位序存在错误 | FPGA 和上位机可能按不同长度或位序实现 | 旧文档仅作驱动历史参考，正式实现必须使用新测试向量 |
 | 高 | `event_seq` 只能发现丢事件，不能恢复关键任务结果 | 丢失 `JOB_DONE` 后上位机无法判断任务是否完成 | V1 增加 `QUERY_JOB`，事件作为通知，查询结果作为事实来源 |
 | 高 | `ACK`、`DONE` 和长任务结束规则不够严格 | ARM 与上位机可能对事务何时结束理解不同 | 短命令只返回 `DONE/ERR`；长命令 `ACK job_id` 后转任务事件 |
 | 高 | 文本字段、重复键、未知键、大小写和 CRC 规范未冻结 | 双方解析结果或 CRC 计算可能不一致 | V1 给出正式语法、必选字段和固定 CRC 测试向量 |
 | 高 | HELLO 示例固定 `seq=1`，缺少连接随机标识 | 重连时旧缓存响应可能错误完成新握手 | V1 使用随机非零 seq 和 64 位 `host_session_id` |
+| 高 | V0 停止会取消本地在途命令且不等待响应 | 旧响应迟到后可能错误完成紧接着发送的新命令 | 基础流程接受该边界，V1 使用事务号并定义迟到响应处理 |
 | 高 | 10 Gbps 光口承载 30 fps RAW12 的余量较小 | 线路编码和协议开销可能导致持续带宽不足 | 确认编码和开销，完成端到端带宽预算及压力测试 |
 | 中 | 80 字节帧头的版本、CRC、flags 和时间基准未完全定义 | 升级、校验和时间关联存在歧义 | FPGA 联调前冻结字段表、计算范围、字节序和测试帧 |
-| 中 | `SEND_IMAGE`、`START_CORR` 和 `QUIT` 语义不够明确 | 误操作、状态不一致或与自动恢复冲突 | 正式协议改为明确的采集和校正命令，生产界面移除 `QUIT` |
+| 中 | `START_CORR` 语义不够明确 | 误操作、状态不一致或与自动恢复冲突 | 正式协议需要明确校正命令 |
 
 ### 16.1 旧 PCIe 参考数据更正
 
@@ -674,7 +704,7 @@ RAW12 是否打包以及准确位序
 
 ```text
 V0 命令仅用于人工联通和基础流程验证
-不自动重试 MAKE_OFFSET、MAKE_GAIN、START_CORR 等有副作用命令
+不自动重试 SEND_SINGLE、START_CONTINUOUS、MAKE_OFFSET、MAKE_GAIN、START_CORR 等有副作用命令
 不把串口打开等同于正式设备在线
 不把界面 FPS 当作 PCIe 零丢帧证明
 不固化旧 PCIe 参考文档中的帧长度和 RAW12 位序

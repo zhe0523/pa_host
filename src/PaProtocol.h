@@ -25,8 +25,9 @@ public:
         MakeGain,
         ConfigTemplate,
         StartCorrection,
-        SendImage,
-        Quit
+        SendSingle,
+        StartContinuous,
+        StopTransfer
     };
 
     struct Response {

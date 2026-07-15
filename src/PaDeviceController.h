@@ -25,6 +25,10 @@ struct PaDeviceStatus {
     int writeEnd = -1;
     int correctionState = -1;
     int correctionEnd = -1;
+    QString model;
+    QString serialNumber;
+    QString armVersion;
+    QString fpgaVersion;
     QString rawLine;
 };
 
@@ -57,6 +61,7 @@ signals:
     void errorOccurred(const QString& message);
 
 private:
+    bool sendImmediateCommand(PaProtocol::Command command, QString* errorMessage);
     void handleTransportConnectionChanged(bool connected);
     void handleTransportError(const QString& message);
     void handleLineReceived(const QString& line);

@@ -19,10 +19,12 @@ QString PaProtocol::commandText(Command command) {
         return "CONFIG_TEMPLATE";
     case Command::StartCorrection:
         return "START_CORR";
-    case Command::SendImage:
-        return "SEND_IMAGE";
-    case Command::Quit:
-        return "QUIT";
+    case Command::SendSingle:
+        return "SEND_SINGLE";
+    case Command::StartContinuous:
+        return "START_CONTINUOUS";
+    case Command::StopTransfer:
+        return "STOP_TRANSFER";
     }
     return QString();
 }
@@ -43,10 +45,12 @@ QString PaProtocol::commandName(Command command) {
         return QStringLiteral("配置模板");
     case Command::StartCorrection:
         return QStringLiteral("启动校正");
-    case Command::SendImage:
+    case Command::SendSingle:
         return QStringLiteral("手动上图");
-    case Command::Quit:
-        return QStringLiteral("退出 ARM");
+    case Command::StartContinuous:
+        return QStringLiteral("开始持续上图");
+    case Command::StopTransfer:
+        return QStringLiteral("停止上图");
     }
     return QStringLiteral("未知命令");
 }
@@ -60,8 +64,9 @@ QStringList PaProtocol::commandNames() {
         commandText(Command::MakeGain),
         commandText(Command::ConfigTemplate),
         commandText(Command::StartCorrection),
-        commandText(Command::SendImage),
-        commandText(Command::Quit),
+        commandText(Command::SendSingle),
+        commandText(Command::StartContinuous),
+        commandText(Command::StopTransfer),
     };
 }
 

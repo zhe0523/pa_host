@@ -80,25 +80,29 @@ ImageListPanel::ImageListPanel(QWidget* parent)
         }
     });
 
-    auto* removeButton = new QPushButton(QStringLiteral("移除选中图像"), this);
-    removeButton->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
-    removeButton->setToolTip(QStringLiteral("从列表移除选中图像，不删除源文件"));
-    connect(removeButton, &QPushButton::clicked, this, &ImageListPanel::removeSelectedImages);
+    removeButton_ = new QPushButton(QStringLiteral("移除选中图像"), this);
+    removeButton_->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
+    removeButton_->setToolTip(QStringLiteral("从列表移除选中图像，不删除源文件"));
+    connect(removeButton_, &QPushButton::clicked, this, &ImageListPanel::removeSelectedImages);
 
     removeAction_ = new QAction(QStringLiteral("移除选中图像"), imageList_);
     removeAction_->setShortcut(QKeySequence::Delete);
     removeAction_->setShortcutContext(Qt::WidgetWithChildrenShortcut);
     imageList_->addAction(removeAction_);
     connect(removeAction_, &QAction::triggered, this, &ImageListPanel::removeSelectedImages);
+    connect(imageList_, &QListWidget::itemSelectionChanged,
+        this, &ImageListPanel::updateRemovalControls);
     connect(imageList_, &QListWidget::customContextMenuRequested, this, &ImageListPanel::showContextMenu);
 
     layout->addWidget(imageList_);
-    layout->addWidget(removeButton);
+    layout->addWidget(removeButton_);
+    updateRemovalControls();
 }
 
 void ImageListPanel::clearImages() {
     const QSignalBlocker blocker(imageList_);
     imageList_->clear();
+    updateRemovalControls();
 }
 
 void ImageListPanel::addOrUpdateImage(const QString& path, const TiRawImage* image) {
@@ -117,6 +121,7 @@ void ImageListPanel::addOrUpdateImage(const QString& path, const TiRawImage* ima
         item->setIcon(makeImageThumbnail(*image));
         item->setData(kThumbnailReadyRole, true);
     }
+    updateRemovalControls();
 }
 
 void ImageListPanel::ensureThumbnail(const QString& path, const TiRawImage& image) {
@@ -139,6 +144,7 @@ void ImageListPanel::setCurrentPath(const QString& path) {
     const QSignalBlocker blocker(imageList_);
     imageList_->setCurrentItem(item, QItemSelectionModel::ClearAndSelect);
     imageList_->scrollToItem(item);
+    updateRemovalControls();
 }
 
 QString ImageListPanel::currentPath() const {
@@ -161,6 +167,17 @@ QListWidgetItem* ImageListPanel::findItem(const QString& path) const {
     return nullptr;
 }
 
+void ImageListPanel::updateRemovalControls() {
+    const bool canRemove = imageList_ != nullptr
+        && (!imageList_->selectedItems().isEmpty() || imageList_->currentItem() != nullptr);
+    if (removeButton_ != nullptr) {
+        removeButton_->setEnabled(canRemove);
+    }
+    if (removeAction_ != nullptr) {
+        removeAction_->setEnabled(canRemove);
+    }
+}
+
 void ImageListPanel::removeSelectedImages() {
     QList<QListWidgetItem*> selected = imageList_->selectedItems();
     if (selected.isEmpty() && imageList_->currentItem() != nullptr) {
@@ -181,6 +198,7 @@ void ImageListPanel::removeSelectedImages() {
             imageList_->setCurrentRow(nextRow);
         }
     }
+    updateRemovalControls();
     emit imagesRemoved(selected.size(), currentPath());
 }
 

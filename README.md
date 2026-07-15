@@ -24,6 +24,7 @@ src/ImageExportService.* 原始图像和显示图像导出服务
 src/ImageAlgorithms.* 图像算法接口和当前内置实现，旧算法从这里替换
 src/ImageSource.*    图像源抽象和本地 .tiraw 连续回放实现
 src/ImageAcquisitionController.* 图像源会话、状态、停止顺序和统计汇总
+src/ImageTransferWorkflowController.* 手动/持续上图模式和客户按钮状态
 src/ImageSession.*   当前图像帧、显示渲染和算法调用的应用层边界
 src/FramePresentationController.* 最新帧选择、显示限速、实际 FPS 和丢帧统计
 src/ReplayPresentationScheduler.* 1～120 fps 显示时间调度策略
@@ -127,6 +128,7 @@ ImageExportService 格式元数据、后缀、RAW16 和显示图导出
 ReplayPresentationScheduler 60 fps 补偿、迟到追帧和帧率边界
 FramePresentationController 最新帧覆盖、停止丢帧和统计周期重置
 ImageAcquisitionController 启停、首帧、源销毁、自然结束和迟到帧隔离
+ImageTransferWorkflowController 模式选择、单帧、持续启动、停止和错误恢复
 LocalReplaySource 帧序号、停止状态、快速重启、坏文件跳过和统计
 ESF / LSF / MTF 基础分析与 CSV 导出
 ```
@@ -143,7 +145,7 @@ pa_host_tests 无界面核心测试
 pa_image_benchmark 真实 TiRaw 性能基准工具
 ```
 
-`MainWindow` 只负责模块组装和跨模块工作流：图像列表内部行为由 `ImageListPanel` 管理，文件编码由 `ImageExportService` 管理，图像源启停和会话统计由 `ImageAcquisitionController` 管理，显示限速由 `FramePresentationController` 管理，纯时间计算由 `ReplayPresentationScheduler` 管理。主窗口不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
+`MainWindow` 只负责模块组装和跨模块工作流：图像列表内部行为由 `ImageListPanel` 管理，文件编码由 `ImageExportService` 管理，客户上图按钮由 `ImageTransferWorkflowController` 管理，图像源启停和会话统计由 `ImageAcquisitionController` 管理，显示限速由 `FramePresentationController` 管理，纯时间计算由 `ReplayPresentationScheduler` 管理。主窗口不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
 
 RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命令、响应和 5 秒超时；`MainWindow` 不再解析 ASCII 响应。未连接或命令执行中时，PA/FPGA 命令会自动禁用。设备返回有效响应、发生超时或传输错误后，控制器会统一恢复或切换错误状态。错误状态下如果串口仍保持打开，可以直接重试命令。
 
@@ -160,13 +162,41 @@ RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命�
 当前版本已经把旧 Windows 上位机里最常用的一段图像查看工作流补齐：
 
 ```text
-顶部菜单：文件 / RS422 / PA/FPGA / 视图 / 校准 / 工具 / 帮助
+顶部菜单：文件 / RS422 / PA/FPGA / 视图 / 工具 / 帮助
 顶部模式条：Idle / Continuous / 手动上图 / 停止上图
 左侧：带缩略图的图像列表，可点击切换和移除
 中间：图像画布
 右侧：图像操作 / 窗宽窗位 / 图像信息
-底部：型号 / 串口 / 连接状态 / 工作模式 / 图像尺寸 / 缩放
+底部：型号 / 序列号 / 连接状态 / 工作模式 / 图像尺寸 / 缩放 / 显示 FPS
 ```
+
+“帮助 -> 关于 PA Host”显示软件版本、编译时间、ARM 程序版本和 FPGA 版本。设备版本来自
+`STATUS` 响应中的可选字段 `arm_version`、`fpga_version`；设备尚未连接或当前 ARM 程序
+未返回对应字段时显示“未获取”。
+
+没有图像时，保存、最大化、右侧图像操作和窗宽窗位控件均禁用；自动窗宽窗位开启时，
+手动窗位/窗宽控件禁用。停止回放后状态栏恢复“显示 FPS: --”，不保留已经停止会话的
+目标帧率。型号和序列号可由 `STATUS` 的可选 `model`、`serial` 字段更新。
+
+顶部模式条是正式用户上图入口：
+
+```text
+选择 Idle         只选择手动模式，不发送设备命令
+点击“手动上图”   发送 SEND_SINGLE，要求 FPGA 发送一张图像
+选择 Continuous   只选择持续模式，不发送设备命令
+点击“开始上图”   发送 START_CONTINUOUS，FPGA 随后自动持续发送
+点击“停止上图”   发送 STOP_TRANSFER，停止当前单帧或持续发送
+```
+
+模式选择和开始操作分开，保证客户明确确认后才开始传图。持续上图运行期间模式和开始按钮
+锁定，只保留停止按钮；开始命令等待响应时也可以点击停止。`STOP_TRANSFER` 写出后不等待
+设备回包，上位机立即取消原命令的本地等待和超时计时，恢复模式选择及开始按钮。停止后
+保留 Continuous 选择，允许再次开始。`PA/FPGA` 原始命令
+菜单和“运行日志”当前仅用于研发及维护联调，正式用户流程不依赖这些入口。
+
+所有不可执行的顶部按钮必须显示为灰色；保持蓝色或绿色的按钮必须能够立即响应点击。
+未连接时四个顶部按钮全部变灰，等待开始响应时只有“停止上图”保持绿色。停止命令写出
+成功后界面立即回到就绪状态，不存在等待停止响应期间的按钮锁定。
 
 图像交互：
 
@@ -178,6 +208,10 @@ Shift+左键拖框：按 ROI 重新计算窗位/窗宽
 再次普通左键点击：清除当前 ROI 框
 鼠标移动：右侧显示当前像素坐标和值
 ```
+
+“保存显示图像”会保存当前窗宽窗位、旋转和翻转后的图像方向；缩放倍率和平移仅属于查看
+状态，不写入输出文件。连续回放中保留 ROI 框时，下方统计随当前帧继续按该 ROI 更新；
+清除框或切换图像后恢复全图统计。
 
 图像输入：
 
@@ -220,11 +254,13 @@ MAKE_OFFSET
 MAKE_GAIN
 CONFIG_TEMPLATE
 START_CORR
-SEND_IMAGE
-QUIT
+SEND_SINGLE
+START_CONTINUOUS
+STOP_TRANSFER
 ```
 
-界面文案中 `SEND_IMAGE` 已统一显示为“手动上图”。
+`SEND_SINGLE`、`START_CONTINUOUS` 和 `STOP_TRANSFER` 分别对应单帧、持续启动和停止当前传输。
+模式按钮本身不属于通信协议，不发送命令。
 
 响应示例：
 
@@ -297,6 +333,7 @@ Shift+ROI 按区域重算窗位窗宽
 连续帧实际 FPS、错误和完成统计
 RS422 命令状态、超时和结构化 STATUS 处理
 图像采集会话状态、统一停止顺序和迟到帧隔离
+主界面手动/持续上图业务状态和三条独立控制命令
 分级滚动日志、运行日志 Dock 和诊断文本导出
 串口参数、命令超时和最近目录持久化
 相同尺寸连续帧保持当前图像视图状态

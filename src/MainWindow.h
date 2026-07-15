@@ -31,12 +31,12 @@ class QPushButton;
 class QSlider;
 class QAction;
 class ImageAcquisitionController;
+class ImageTransferWorkflowController;
 class ImageListPanel;
 class AppLogService;
 class AppSettings;
 class PaDeviceController;
 enum class PaDeviceState;
-struct PaDeviceStatus;
 
 /*
  * 主窗口。
@@ -65,6 +65,7 @@ private slots:
     void toggleImageMaximized();
     void exportDiagnostics();
     void configureCommandTimeout();
+    void showAbout();
 
 private:
     QWidget* createTopBar();
@@ -86,12 +87,15 @@ private:
     void updatePixelInfo(const QPoint& imagePoint);
     void showRoiInfo(const TiRawImage::RoiStats& stats);
     void updateRoiInfo(const QRect& imageRect);
+    void updateCurrentImageInfo();
     void updateFullImageInfo();
     void handleAnalysisRoi(const QRect& imageRect);
     void applyWindowLevelFromRoi(const QRect& imageRect);
     void handlePresentedFrame(const ImageFrame& frame);
+    void updateImageUiState();
+    void updateWindowLevelControlState();
+    void updateImageTransferControls();
     void updateDeviceState(PaDeviceState state);
-    void updateDeviceStatus(const PaDeviceStatus& status);
 
     SerialClient serial_;
     std::unique_ptr<AppSettings> settings_;
@@ -100,15 +104,20 @@ private:
     LocalReplaySource* replaySource_ = nullptr;
     ImageAcquisitionController* acquisitionController_ = nullptr;
     PaDeviceController* deviceController_ = nullptr;
+    ImageTransferWorkflowController* imageTransferController_ = nullptr;
 
     QWidget* topBar_ = nullptr;
     ImageListPanel* imageListPanel_ = nullptr;
     QWidget* rightPanel_ = nullptr;
+    QWidget* imageOpsPanel_ = nullptr;
+    QWidget* windowLevelPanel_ = nullptr;
     ImageView* imageView_ = nullptr;
     QDockWidget* logDock_ = nullptr;
     QPlainTextEdit* logView_ = nullptr;
     QMenu* viewMenu_ = nullptr;
     QAction* imageMaximizeAction_ = nullptr;
+    QAction* stopReplayAction_ = nullptr;
+    QAction* saveDisplayAction_ = nullptr;
     QAction* refreshPortsAction_ = nullptr;
     QAction* connectSerialAction_ = nullptr;
     QAction* disconnectSerialAction_ = nullptr;
@@ -116,8 +125,10 @@ private:
 
     QComboBox* portCombo_ = nullptr;
     QSpinBox* baudSpin_ = nullptr;
-    QPushButton* manualImageButton_ = nullptr;
-    QPushButton* statusButton_ = nullptr;
+    QPushButton* idleModeButton_ = nullptr;
+    QPushButton* continuousModeButton_ = nullptr;
+    QPushButton* startImageButton_ = nullptr;
+    QPushButton* stopImageButton_ = nullptr;
 
     QCheckBox* autoWindowCheck_ = nullptr;
     QSlider* centerSlider_ = nullptr;
@@ -140,6 +151,9 @@ private:
     QCache<QString, QImage> frameDisplayCache_;
     QHash<QString, TiRawImage::RoiStats> stableFrameStatsCache_;
     QElapsedTimer imageInfoTimer_;
+    QRect activeRoi_;
+    QString armProgramVersion_;
+    QString fpgaVersion_;
     bool resetViewStateOnRefresh_ = false;
     bool imageMaximized_ = false;
 };
