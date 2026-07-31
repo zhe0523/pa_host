@@ -21,6 +21,7 @@
 #include <QDockWidget>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFrame>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QGuiApplication>
@@ -861,17 +862,23 @@ QWidget* MainWindow::createWindowLevelPanel() {
 QWidget* MainWindow::createImageInfoPanel() {
     auto* group = new QGroupBox(QStringLiteral("图像信息"), this);
     auto* layout = new QVBoxLayout(group);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(6);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(8);
 
     pixelInfoLabel_ = new QLabel(QStringLiteral("像素值: --"), group);
     pixelInfoLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    auto* separator = new QFrame(group);
+    separator->setFrameShape(QFrame::HLine);
+    separator->setFrameShadow(QFrame::Plain);
+    separator->setStyleSheet(QStringLiteral("color:#d8e0ea;"));
 
     roiInfoLabel_ = new QLabel(QStringLiteral("ROI 信息: --"), group);
     roiInfoLabel_->setWordWrap(true);
     roiInfoLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     layout->addWidget(pixelInfoLabel_);
+    layout->addWidget(separator);
     layout->addWidget(roiInfoLabel_);
     return group;
 }
@@ -1229,7 +1236,7 @@ void MainWindow::updatePixelInfo(const QPoint& imagePoint) {
         return;
     }
 
-    pixelInfoLabel_->setText(QStringLiteral("像素值(%1,%2):%3")
+    pixelInfoLabel_->setText(QStringLiteral("像素值 (%1, %2): %3")
                                  .arg(imagePoint.x())
                                  .arg(imagePoint.y())
                                  .arg(value));
@@ -1243,22 +1250,23 @@ void MainWindow::showRoiInfo(const TiRawImage::RoiStats& stats) {
     const TiRawImage& image = imageSession_->image();
     const bool fullImage = stats.rect == QRect(0, 0, image.width(), image.height());
     roiInfoLabel_->setText(QStringLiteral(
-                               "区域 %1\n"
-                               "范围 (%2,%3)-(%4,%5)\n"
-                               "像素 %6\n"
-                               "均值 %7\n"
-                               "最小/最大 %8 / %9\n"
-                               "标准差 %10\n"
-                               "行噪声 %11")
-                               .arg(fullImage ? QStringLiteral("全图") : QStringLiteral("ROI"))
+                               "ROI 信息: %1\n"
+                               "区域: (%2, %3) - (%4, %5)\n"
+                               "像素数量: %6\n"
+                               "均值: %7\n"
+                               "最大值: %8\n"
+                               "最小值: %9\n"
+                               "标准差: %10\n"
+                               "行噪声: %11")
+                               .arg(fullImage ? QStringLiteral("全图") : QStringLiteral("当前框选"))
                                .arg(stats.rect.left())
                                .arg(stats.rect.top())
                                .arg(stats.rect.right())
                                .arg(stats.rect.bottom())
                                .arg(stats.pixelCount)
                                .arg(QString::number(stats.mean, 'f', 4))
-                               .arg(stats.min)
                                .arg(stats.max)
+                               .arg(stats.min)
                                .arg(QString::number(stats.stddev, 'f', 4))
                                .arg(QString::number(stats.rowNoise, 'f', 4)));
 }

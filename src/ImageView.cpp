@@ -21,6 +21,13 @@ int pixmapCostMiB(const QPixmap& pixmap) {
         * pixmap.height() * bytesPerPixel;
     return static_cast<int>(std::max<qint64>(1, (bytes + kBytesPerMiB - 1) / kBytesPerMiB));
 }
+
+QPen roiPen(const QColor& color) {
+    QPen pen(color);
+    pen.setWidthF(1.0);
+    pen.setCosmetic(true);
+    return pen;
+}
 }
 
 ImageView::ImageView(QWidget* parent)
@@ -198,10 +205,10 @@ void ImageView::mousePressEvent(QMouseEvent* event) {
             roiStart_ = imagePoint;
             setDragMode(QGraphicsView::NoDrag);
             if (roiItem_ == nullptr) {
-                roiItem_ = scene_.addRect(QRectF(), QPen(QColor(255, 230, 0), 1.4), Qt::NoBrush);
+                roiItem_ = scene_.addRect(QRectF(), roiPen(QColor(255, 230, 0)), Qt::NoBrush);
                 roiItem_->setZValue(10.0);
             }
-            roiItem_->setPen(QPen(selectionMode_ == SelectionMode::Analysis ? QColor(255, 125, 0) : QColor(36, 170, 84), 1.4));
+            roiItem_->setPen(roiPen(selectionMode_ == SelectionMode::Analysis ? QColor(255, 125, 0) : QColor(36, 170, 84)));
             roiItem_->setRect(QRectF(roiStart_, QSizeF(1, 1)));
             event->accept();
             return;
