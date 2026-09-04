@@ -7,6 +7,7 @@
 #include "ImageListPanel.h"
 #include "ImageTransferWorkflowController.h"
 #include "PaDeviceController.h"
+#include "PcieImageSource.h"
 
 #include <QAction>
 #include <QBoxLayout>
@@ -49,6 +50,20 @@
 
 namespace {
 constexpr int kStaticImageRefreshIntervalMs = 33;
+constexpr int kCachedRawFrameCount = 12;
+constexpr int kCachedDisplayFrameCount = 12;
+constexpr int kLiveDisplayMaxLongEdge = 2048;
+
+QSize scaledDisplaySize(const QSize& sourceSize, int maxLongEdge) {
+    if (sourceSize.isEmpty() || maxLongEdge <= 0) {
+        return sourceSize;
+    }
+    const int longEdge = std::max(sourceSize.width(), sourceSize.height());
+    if (longEdge <= maxLongEdge) {
+        return sourceSize;
+    }
+    return sourceSize.scaled(QSize(maxLongEdge, maxLongEdge), Qt::KeepAspectRatio);
+}
 
 QSize initialWindowSize() {
     auto* screen = QGuiApplication::primaryScreen();
@@ -71,21 +86,45 @@ QPushButton* makeCommandButton(const QString& text) {
 }
 
 void populateSerialPorts(QComboBox* combo) {
+    const QString currentPort = combo->currentText();
     combo->clear();
     combo->setEditable(true);
+
+    auto addPortIfMissing = [combo](const QString& port) {
+        if (!port.isEmpty() && combo->findText(port) < 0) {
+            combo->addItem(port);
+        }
+    };
+
+#ifndef Q_OS_WIN
+    /*
+     * Kylin 实机的 RS422 使用 WCH 多串口卡。Qt/udev 有时只枚举到 ttyS*，
+     * 所以这里始终提供 ttyWCH0~3，并放在前面方便现场选择。
+     */
+    addPortIfMissing(QStringLiteral("/dev/ttyWCH0"));
+    addPortIfMissing(QStringLiteral("/dev/ttyWCH1"));
+    addPortIfMissing(QStringLiteral("/dev/ttyWCH2"));
+    addPortIfMissing(QStringLiteral("/dev/ttyWCH3"));
+#endif
+
     for (const QSerialPortInfo& info : QSerialPortInfo::availablePorts()) {
 #ifdef Q_OS_WIN
-        combo->addItem(info.portName());
+        addPortIfMissing(info.portName());
 #else
-        combo->addItem(info.systemLocation());
+        const QString location = info.systemLocation();
+        addPortIfMissing(location);
 #endif
     }
     if (combo->count() == 0) {
 #ifdef Q_OS_WIN
-        combo->addItems({QStringLiteral("COM1"), QStringLiteral("COM2"), QStringLiteral("COM3"), QStringLiteral("COM4")});
-#else
-        combo->addItems({QStringLiteral("/dev/ttyS0"), QStringLiteral("/dev/ttyS1"), QStringLiteral("/dev/ttyUSB0")});
+        addPortIfMissing(QStringLiteral("COM1"));
+        addPortIfMissing(QStringLiteral("COM2"));
+        addPortIfMissing(QStringLiteral("COM3"));
+        addPortIfMissing(QStringLiteral("COM4"));
 #endif
+    }
+    if (!currentPort.isEmpty()) {
+        combo->setCurrentText(currentPort);
     }
 }
 
@@ -270,11 +309,13 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     }
     imageSession_ = std::make_unique<ImageSession>(std::move(algorithms), this);
     replaySource_ = new LocalReplaySource(this);
+    pcieSource_ = new PcieImageSource(this);
     acquisitionController_ = new ImageAcquisitionController(this);
     deviceController_ = new PaDeviceController(&serial_, this);
     deviceController_->setCommandTimeoutMs(settings_->commandTimeoutMs());
     imageTransferController_ = new ImageTransferWorkflowController(deviceController_, this);
-    frameDisplayCache_.setMaxCost(4);
+    imageFrameCache_.setMaxCost(kCachedRawFrameCount);
+    frameDisplayCache_.setMaxCost(kCachedDisplayFrameCount);
     setWindowTitle(QStringLiteral("PA Host"));
     setMinimumSize(1180, 820);
     resize(initialWindowSize());
@@ -336,10 +377,11 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
                 fpgaVersion_ = status.fpgaVersion;
             }
             logService_->debug(QStringLiteral("RS422"),
-                QStringLiteral("设备状态: pa=%1 com=%2 rst=%3 wr=%4/%5 corr=%6/%7 arm=%8 fpga=%9")
-                    .arg(status.paFlags)
-                    .arg(status.communicationFlags)
-                    .arg(status.resetFlags)
+                QStringLiteral("设备状态: int_vector=%1 pa_version=%2 com_version=%3 rst_state=%4 wr=%5/%6 corr=%7/%8 arm=%9 fpga=%10")
+                    .arg(status.interruptVector)
+                    .arg(status.paVersion)
+                    .arg(status.communicationVersion)
+                    .arg(status.resetState)
                     .arg(status.writeState)
                     .arg(status.writeEnd)
                     .arg(status.correctionState)
@@ -386,10 +428,8 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     connect(acquisitionController_, &ImageAcquisitionController::framePresented,
         this, &MainWindow::handlePresentedFrame);
     connect(acquisitionController_, &ImageAcquisitionController::fpsUpdated,
-        this, [this](double actualFps, int targetFps) {
-            fpsLabel_->setText(QStringLiteral("显示 FPS: %1 / 目标: %2")
-                                   .arg(actualFps, 0, 'f', 2)
-                                   .arg(targetFps));
+        this, [this](double actualFps, int) {
+            fpsLabel_->setText(QStringLiteral("显示 FPS: %1").arg(actualFps, 0, 'f', 2));
         });
     connect(acquisitionController_, &ImageAcquisitionController::stateChanged,
         this, [this]() {
@@ -408,8 +448,17 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
                 .arg(stats.source.deliveredFrames)
                 .arg(stats.presentation.presentedFrames)
                 .arg(stats.presentation.droppedFrames)
-                .arg(stats.source.failedFrames));
+            .arg(stats.source.failedFrames));
     });
+    connect(pcieSource_, &PcieImageSource::captureInfo,
+        this, [this](const QString& message) {
+            logService_->info(QStringLiteral("IMAGE"), message);
+        });
+    connect(pcieSource_, &PcieImageSource::frameFileSaved,
+        this, [this](const QString& path) {
+            imageListPanel_->addOrUpdateImage(path);
+            imageListPanel_->setCurrentPath(path);
+        });
     imageRefreshTimer_.setSingleShot(true);
     imageRefreshTimer_.setInterval(kStaticImageRefreshIntervalMs);
     connect(&imageRefreshTimer_, &QTimer::timeout, this, [this]() {
@@ -423,6 +472,9 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     updateImageUiState();
     logService_->info(QStringLiteral("SYSTEM"),
         QStringLiteral("应用启动，日志目录: %1").arg(logService_->logDirectory()));
+#ifndef Q_OS_WIN
+    QTimer::singleShot(0, this, &MainWindow::startPcieCapture);
+#endif
 }
 
 void MainWindow::openImage() {
@@ -436,7 +488,6 @@ void MainWindow::openImage() {
         return;
     }
 
-    stopImageReplay();
     settings_->setLastImageDirectory(QFileInfo(paths.first()).absolutePath());
 
     TiRawImage lastImage;
@@ -478,6 +529,14 @@ void MainWindow::openImage() {
 }
 
 void MainWindow::startImageReplay() {
+    if (pcieSource_ != nullptr && pcieSource_->isRunning()) {
+        QMessageBox::information(
+            this,
+            QStringLiteral("PCIe 正在监听"),
+            QStringLiteral("当前软件需要保持 PCIe 上图中断监听，不能切换到本地回放源。"));
+        return;
+    }
+
     const QStringList paths = QFileDialog::getOpenFileNames(
         this,
         QStringLiteral("选择回放 TiRaw 序列"),
@@ -514,7 +573,7 @@ void MainWindow::startImageReplay() {
     for (const QString& path : paths) {
         imageListPanel_->addOrUpdateImage(path);
     }
-    fpsLabel_->setText(QStringLiteral("显示 FPS: 0.00 / 目标: %1").arg(fps));
+    fpsLabel_->setText(QStringLiteral("显示 FPS: 0.00"));
     updateImageUiState();
     const ImageAcquisitionStats acquisitionStats = acquisitionController_->stats();
     const qint64 preloadMs = acquisitionStats.sourceStartElapsedMs;
@@ -530,6 +589,42 @@ void MainWindow::startImageReplay() {
             .arg(fps));
 }
 
+void MainWindow::startPcieCapture() {
+    stopImageReplay();
+    clearFrameDisplayCaches();
+    stableFrameStatsCache_.clear();
+    imageInfoTimer_.invalidate();
+    imageListPanel_->clearImages();
+
+    PcieImageSourceOptions options;
+    options.width = 3072;
+    options.height = 7680;
+    const QString appDataDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    options.outputDirectory = QDir(appDataDirectory.isEmpty() ? QDir::homePath() : appDataDirectory)
+        .filePath(QStringLiteral("pcie_images"));
+    pcieSource_->setOptions(options);
+
+    QString error;
+    constexpr int kPcieDisplayFps = 30;
+    if (!acquisitionController_->start(pcieSource_, kPcieDisplayFps, &error)) {
+        imageView_->setPixmapCacheEnabled(false);
+        updateImageUiState();
+        logService_->warning(QStringLiteral("IMAGE"),
+            QStringLiteral("PCIe 自动监听未启动: %1").arg(error));
+        return;
+    }
+
+    fpsLabel_->setText(QStringLiteral("显示 FPS: 0.00"));
+    updateImageUiState();
+    logService_->info(QStringLiteral("IMAGE"),
+        QStringLiteral("PCIe 自动监听已启动: c2h=%1 event=%2 output=%3 size=%4x%5")
+            .arg(options.c2hDevice)
+            .arg(options.eventDevice)
+            .arg(options.outputDirectory)
+            .arg(options.width)
+            .arg(options.height));
+}
+
 void MainWindow::stopImageReplay() {
     imageRefreshTimer_.stop();
     imageInfoRefreshTimer_.stop();
@@ -542,6 +637,21 @@ void MainWindow::stopImageReplay() {
         fpsLabel_->setText(QStringLiteral("显示 FPS: --"));
     }
     updateImageUiState();
+}
+
+void MainWindow::stopDynamicMode() {
+    /*
+     * 这个菜单项只通知 FPGA/ARM 停止动态模式，不控制上位机 PCIe 图像接收。
+     * PCIe 监听属于软件常驻能力，只要程序运行且设备可用就保持处理上图中断。
+     */
+    QString error;
+    if (!deviceController_->sendCommand(PaProtocol::Command::StopDynamic, &error)) {
+        logService_->warning(QStringLiteral("RS422"),
+            QStringLiteral("停止动态模式命令发送失败: %1").arg(error));
+        QMessageBox::warning(this, QStringLiteral("停止动态模式失败"), error);
+        return;
+    }
+    logService_->info(QStringLiteral("RS422"), QStringLiteral("已发送 STOP_DYNC"));
 }
 
 void MainWindow::saveDisplayImage() {
@@ -584,6 +694,11 @@ void MainWindow::connectSerial() {
         QStringLiteral("串口已打开: %1 @ %2")
             .arg(portCombo_->currentText())
             .arg(baudSpin_->value()));
+    QString statusError;
+    if (!deviceController_->sendCommand(PaProtocol::Command::Status, &statusError)) {
+        logService_->warning(QStringLiteral("RS422"),
+            QStringLiteral("连接后读取状态失败: %1").arg(statusError));
+    }
 }
 
 void MainWindow::disconnectSerial() {
@@ -907,14 +1022,14 @@ void MainWindow::createMenus() {
     auto* fileMenu = menuBar()->addMenu(QStringLiteral("文件"));
     auto* openAction = fileMenu->addAction(QStringLiteral("打开 TiRaw 图像"));
     auto* replayAction = fileMenu->addAction(QStringLiteral("回放 TiRaw 序列"));
-    stopReplayAction_ = fileMenu->addAction(QStringLiteral("停止图像回放"));
+    stopReplayAction_ = fileMenu->addAction(QStringLiteral("停止动态模式"));
     saveDisplayAction_ = fileMenu->addAction(QStringLiteral("保存显示图像"));
     fileMenu->addSeparator();
     auto* quitAction = fileMenu->addAction(QStringLiteral("退出"));
 
     connect(openAction, &QAction::triggered, this, &MainWindow::openImage);
     connect(replayAction, &QAction::triggered, this, &MainWindow::startImageReplay);
-    connect(stopReplayAction_, &QAction::triggered, this, &MainWindow::stopImageReplay);
+    connect(stopReplayAction_, &QAction::triggered, this, &MainWindow::stopDynamicMode);
     connect(saveDisplayAction_, &QAction::triggered, this, &MainWindow::saveDisplayImage);
     connect(quitAction, &QAction::triggered, this, &QWidget::close);
 
@@ -964,6 +1079,7 @@ void MainWindow::createMenus() {
         {PaProtocol::Command::SendSingle, "单帧上图"},
         {PaProtocol::Command::StartContinuous, "开始持续上图"},
         {PaProtocol::Command::StopTransfer, "停止上图"},
+        {PaProtocol::Command::StopDynamic, "停止动态模式"},
     };
     for (const MenuCommand& item : commands) {
         QAction* action = commandMenu->addAction(QString::fromUtf8(item.text), this, [this, item]() {
@@ -1041,12 +1157,45 @@ void MainWindow::handleImageListSelection(const QString& path) {
         return;
     }
 
-    stopImageReplay();
+    QElapsedTimer totalTimer;
+    QElapsedTimer stageTimer;
+    totalTimer.start();
+    logService_->info(QStringLiteral("IMAGE"),
+        QStringLiteral("切换图像开始: %1").arg(path));
+
+    const bool keepPcieListening = pcieSource_ != nullptr && pcieSource_->isRunning();
+    if (!keepPcieListening) {
+        stopImageReplay();
+    }
     const QString displayedPath = imageSession_->hasImage()
         ? imageSession_->image().path()
         : QString();
     QString error;
-    if (!imageSession_->loadFile(path, &error)) {
+    stageTimer.start();
+    const QString cacheKey = normalizedImagePath(path);
+    bool frameCacheHit = false;
+    if (const ImageFrame* cachedFrame = imageFrameCache_.object(cacheKey)) {
+        frameCacheHit = true;
+        if (!imageSession_->setFrame(*cachedFrame, &error)) {
+            imageFrameCache_.remove(cacheKey);
+            frameCacheHit = false;
+        }
+    }
+    if (!error.isEmpty() || !imageSession_->hasImage()
+        || normalizedImagePath(imageSession_->image().path()) != cacheKey) {
+        error.clear();
+        if (!imageSession_->loadFilePreview(path, &error)) {
+            if (!displayedPath.isEmpty()) {
+                imageListPanel_->setCurrentPath(displayedPath);
+            }
+            QMessageBox::warning(this, QStringLiteral("打开失败"), error);
+            logService_->error(QStringLiteral("IMAGE"),
+                QStringLiteral("切换图像失败: %1, %2").arg(path, error));
+            return;
+        }
+        imageFrameCache_.insert(cacheKey, new ImageFrame(imageSession_->currentFrame()));
+    }
+    if (!error.isEmpty()) {
         if (!displayedPath.isEmpty()) {
             imageListPanel_->setCurrentPath(displayedPath);
         }
@@ -1055,12 +1204,30 @@ void MainWindow::handleImageListSelection(const QString& path) {
             QStringLiteral("切换图像失败: %1, %2").arg(path, error));
         return;
     }
+    const qint64 loadMs = stageTimer.elapsed();
+
+    stageTimer.restart();
     imageListPanel_->ensureThumbnail(path, imageSession_->image());
+    const qint64 thumbnailMs = stageTimer.elapsed();
+
+    stageTimer.restart();
     showCurrentSessionImage(path, true);
+    const qint64 displayMs = stageTimer.elapsed();
+    logService_->info(QStringLiteral("IMAGE"),
+        QStringLiteral("切换图像完成: cache=%1 load=%2ms thumbnail=%3ms display=%4ms total=%5ms path=%6")
+            .arg(frameCacheHit ? 1 : 0)
+            .arg(loadMs)
+            .arg(thumbnailMs)
+            .arg(displayMs)
+            .arg(totalTimer.elapsed())
+            .arg(path));
 }
 
 void MainWindow::handleImagesRemoved(int count, const QString& nextPath) {
-    stopImageReplay();
+    /*
+     * 删除列表项只表示“从历史列表移除”，不能影响正在运行的 PCIe 中断监听。
+     * PCIe 监听是常驻图像入口，不能被列表、显示或 FPGA 控制命令间接停止。
+     */
     logService_->info(QStringLiteral("IMAGE"),
         QStringLiteral("从图像列表移除 %1 项（源文件未删除）").arg(count));
     if (nextPath.isEmpty()) {
@@ -1132,10 +1299,20 @@ void MainWindow::showCurrentSessionImage(const QString& source, bool resetViewSt
         return;
     }
 
+    QElapsedTimer totalTimer;
+    QElapsedTimer stageTimer;
+    totalTimer.start();
+    stageTimer.start();
     const TiRawImage& image = imageSession_->image();
-    clearFrameDisplayCaches();
-    stableFrameStatsCache_.clear();
+    /*
+     * 这里不能清显示缓存。历史图像切换时 contentCacheKey 是文件路径，
+     * 保留 QImage/QPixmap/ROI 统计缓存可以把重复切换的耗时压到很低。
+     * 窗宽窗位变化、清空图像、停止回放等真正会让显示内容失效的路径会单独清缓存。
+     */
     imageView_->setPixmapCacheEnabled(!imageSession_->currentFrame().contentCacheKey.isEmpty());
+    const qint64 cacheSetupMs = stageTimer.elapsed();
+
+    stageTimer.restart();
     imageLabel_->setText(QStringLiteral("图像尺寸: %1 x %2")
                              .arg(image.width())
                              .arg(image.height()));
@@ -1143,8 +1320,17 @@ void MainWindow::showCurrentSessionImage(const QString& source, bool resetViewSt
     pixelInfoLabel_->setText(QStringLiteral("像素值: --"));
     updateImageUiState();
     activeRoi_ = {};
-    updateFullImageInfo();
+    const qint64 controlsMs = stageTimer.elapsed();
+
+    if (roiInfoLabel_ != nullptr) {
+        roiInfoLabel_->setText(QStringLiteral("ROI 信息: 统计中..."));
+    }
+    imageInfoRefreshTimer_.stop();
+    const qint64 statsMs = 0;
+
+    stageTimer.restart();
     const WindowLevelResult autoWindow = imageSession_->autoWindowLevel();
+    const qint64 autoWindowMs = stageTimer.elapsed();
     logService_->info(QStringLiteral("IMAGE"),
         QStringLiteral("打开图像: %1, %2x%3, min=%4 max=%5, auto center=%6 width=%7")
             .arg(source)
@@ -1154,7 +1340,20 @@ void MainWindow::showCurrentSessionImage(const QString& source, bool resetViewSt
             .arg(image.maxValue())
             .arg(autoWindow.center)
             .arg(autoWindow.width));
+    stageTimer.restart();
     refreshImage(resetViewState);
+    const qint64 refreshMs = stageTimer.elapsed();
+    imageInfoRefreshTimer_.start(1);
+    logService_->info(QStringLiteral("IMAGE"),
+        QStringLiteral("图像显示刷新耗时: cache_setup=%1ms controls=%2ms stats=%3ms auto=%4ms refresh=%5ms total=%6ms reset=%7 source=%8")
+            .arg(cacheSetupMs)
+            .arg(controlsMs)
+            .arg(statsMs)
+            .arg(autoWindowMs)
+            .arg(refreshMs)
+            .arg(totalTimer.elapsed())
+            .arg(resetViewState ? 1 : 0)
+            .arg(source));
 }
 
 void MainWindow::clearCurrentImage() {
@@ -1209,7 +1408,16 @@ void MainWindow::refreshImage(bool resetViewState) {
     }
 
     QImage display;
-    const QString contentCacheKey = imageSession_->currentFrame().contentCacheKey;
+    const ImageFrame currentFrame = imageSession_->currentFrame();
+    const QString contentCacheKey = currentFrame.contentCacheKey;
+    const QSize logicalImageSize(imageSession_->image().width(), imageSession_->image().height());
+    /*
+     * PCIe 实时帧没有稳定文件缓存键。这里对实时显示做降采样，减少 16-bit->8-bit
+     * 映射和 QPixmap 创建成本；原始 16-bit 帧仍保留在 ImageSession 中，像素值/ROI 按原图坐标计算。
+     */
+    const QSize renderSize = contentCacheKey.isEmpty()
+        ? scaledDisplaySize(logicalImageSize, kLiveDisplayMaxLongEdge)
+        : logicalImageSize;
     if (!contentCacheKey.isEmpty()) {
         const QString cacheKey = contentCacheKey
             + QStringLiteral("\n%1\n%2").arg(centerSpin_->value()).arg(widthSpin_->value());
@@ -1220,9 +1428,10 @@ void MainWindow::refreshImage(bool resetViewState) {
             frameDisplayCache_.insert(cacheKey, new QImage(display));
         }
     } else {
-        display = imageSession_->render(centerSpin_->value(), widthSpin_->value());
+        display = imageSession_->render(centerSpin_->value(), widthSpin_->value(), renderSize);
     }
-    imageView_->setImage(display, resetViewState);
+    lastDisplayRenderSize_ = display.size();
+    imageView_->setImage(display, resetViewState, logicalImageSize);
 }
 
 void MainWindow::updatePixelInfo(const QPoint& imagePoint) {
@@ -1283,11 +1492,23 @@ void MainWindow::updateRoiInfo(const QRect& imageRect) {
 }
 
 void MainWindow::updateCurrentImageInfo() {
+    QElapsedTimer timer;
+    timer.start();
     if (activeRoi_.isValid() && !activeRoi_.isEmpty()) {
         updateRoiInfo(activeRoi_);
+        const qint64 elapsedMs = timer.elapsed();
+        if (elapsedMs >= 50) {
+            logService_->info(QStringLiteral("IMAGE"),
+                QStringLiteral("ROI 信息统计耗时: roi=1 elapsed=%1ms").arg(elapsedMs));
+        }
         return;
     }
     updateFullImageInfo();
+    const qint64 elapsedMs = timer.elapsed();
+    if (elapsedMs >= 50) {
+        logService_->info(QStringLiteral("IMAGE"),
+            QStringLiteral("ROI 信息统计耗时: roi=0 elapsed=%1ms").arg(elapsedMs));
+    }
 }
 
 void MainWindow::updateFullImageInfo() {
@@ -1427,6 +1648,11 @@ void MainWindow::applyWindowLevelFromRoi(const QRect& imageRect) {
 }
 
 void MainWindow::handlePresentedFrame(const ImageFrame& frame) {
+    QElapsedTimer uiTimer;
+    QElapsedTimer stageTimer;
+    uiTimer.start();
+    stageTimer.start();
+    const bool isPcieFrame = frame.sourceName.startsWith(QStringLiteral("PCIe #"));
     const bool resetViewState = !imageSession_->hasImage()
         || imageSession_->image().width() != frame.image.width()
         || imageSession_->image().height() != frame.image.height();
@@ -1436,10 +1662,12 @@ void MainWindow::handlePresentedFrame(const ImageFrame& frame) {
             QStringLiteral("接收图像帧失败: %1").arg(error));
         return;
     }
+    const qint64 setFrameMs = stageTimer.elapsed();
     if (resetViewState) {
         activeRoi_ = {};
     }
 
+    stageTimer.restart();
     imageLabel_->setText(QStringLiteral("图像尺寸: %1 x %2")
                              .arg(frame.image.width())
                              .arg(frame.image.height()));
@@ -1450,15 +1678,39 @@ void MainWindow::handlePresentedFrame(const ImageFrame& frame) {
         imageListPanel_->ensureThumbnail(frame.image.path(), frame.image);
         imageListPanel_->setCurrentPath(frame.image.path());
     }
+    const qint64 controlsMs = stageTimer.elapsed();
+
     // 采集控制器已经完成会话隔离、限速和丢帧处理，这里只同步界面状态。
     imageRefreshTimer_.stop();
     const bool shouldResetView = resetViewStateOnRefresh_ || resetViewState;
     resetViewStateOnRefresh_ = false;
+    stageTimer.restart();
     refreshImage(shouldResetView);
-    if ((!imageInfoTimer_.isValid() || imageInfoTimer_.elapsed() >= 1000)
+    const qint64 refreshMs = stageTimer.elapsed();
+    const bool shouldRefreshInfo = !isPcieFrame || (activeRoi_.isValid() && !activeRoi_.isEmpty());
+    if (shouldRefreshInfo
+        && (!imageInfoTimer_.isValid() || imageInfoTimer_.elapsed() >= 1000)
         && !imageInfoRefreshTimer_.isActive()) {
         imageInfoTimer_.restart();
         imageInfoRefreshTimer_.start(1);
+    } else if (isPcieFrame && (activeRoi_.isNull() || activeRoi_.isEmpty()) && roiInfoLabel_ != nullptr) {
+        /*
+         * 实时连续上图时，全图 ROI 统计需要遍历 2359 万像素，容易和显示刷新抢 UI。
+         * 未框选 ROI 时先暂停全图统计；用户框选后仍按原始 16-bit 数据计算该 ROI。
+         */
+        roiInfoLabel_->setText(QStringLiteral("ROI 信息: 实时上图中"));
+    }
+    if (isPcieFrame) {
+        logService_->info(QStringLiteral("IMAGE"),
+            QStringLiteral("PCIe 图像显示完成: source=%1 set_frame=%2ms controls=%3ms refresh=%4ms ui_total=%5ms reset=%6 display=%7x%8")
+                .arg(frame.sourceName)
+                .arg(setFrameMs)
+                .arg(controlsMs)
+                .arg(refreshMs)
+                .arg(uiTimer.elapsed())
+                .arg(shouldResetView ? 1 : 0)
+                .arg(lastDisplayRenderSize_.width())
+                .arg(lastDisplayRenderSize_.height()));
     }
 }
 
@@ -1477,8 +1729,7 @@ void MainWindow::updateImageUiState() {
         imageMaximizeAction_->setEnabled(hasImage || imageMaximized_);
     }
     if (stopReplayAction_ != nullptr) {
-        stopReplayAction_->setEnabled(
-            acquisitionController_ != nullptr && acquisitionController_->isActive());
+        stopReplayAction_->setEnabled(deviceController_ != nullptr && deviceController_->isConnected());
     }
     updateWindowLevelControlState();
 }

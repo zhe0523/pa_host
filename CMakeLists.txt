@@ -20,6 +20,7 @@ set(CMAKE_AUTOUIC ON)
 # 优先使用 Qt6；Kylin V10 上如果只安装 Qt5，也能自动回退到 Qt5。
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets SerialPort)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets SerialPort)
+find_package(Threads REQUIRED)
 
 add_library(pa_core STATIC
     src/AppLogService.cpp
@@ -46,6 +47,8 @@ add_library(pa_core STATIC
     src/MtfAnalysis.h
     src/PaProtocol.cpp
     src/PaProtocol.h
+    src/PcieImageSource.cpp
+    src/PcieImageSource.h
     src/PaDeviceController.cpp
     src/PaDeviceController.h
     src/ReplayPresentationScheduler.cpp
@@ -58,6 +61,7 @@ target_include_directories(pa_core PUBLIC src)
 target_link_libraries(pa_core PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::Gui
+    Threads::Threads
 )
 
 add_library(pa_transport STATIC

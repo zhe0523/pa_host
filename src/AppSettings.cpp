@@ -1,6 +1,7 @@
 #include "AppSettings.h"
 
 #include <QSettings>
+#include <QtGlobal>
 
 #include <algorithm>
 
@@ -19,6 +20,14 @@ constexpr int kMaximumBaudRate = 3000000;
 constexpr int kDefaultCommandTimeoutMs = 5000;
 constexpr int kMinimumCommandTimeoutMs = 100;
 constexpr int kMaximumCommandTimeoutMs = 300000;
+
+QString defaultSerialPort() {
+#ifdef Q_OS_WIN
+    return QString();
+#else
+    return QStringLiteral("/dev/ttyWCH0");
+#endif
+}
 }
 
 AppSettings::AppSettings()
@@ -68,7 +77,7 @@ void AppSettings::setLastDiagnosticDirectory(const QString& directory) {
 }
 
 QString AppSettings::serialPort() const {
-    return settings_->value(QLatin1String(kSerialPortKey)).toString();
+    return settings_->value(QLatin1String(kSerialPortKey), defaultSerialPort()).toString();
 }
 
 void AppSettings::setSerialPort(const QString& portName) {

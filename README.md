@@ -49,20 +49,82 @@ doc/git-commit-note-20260715-image-acquisition-controller.md 图像采集会话�
 
 ## 构建
 
-Kylin 机器需要安装 Qt Widgets、Qt SerialPort 和 CMake。安装好后：
+### Kylin V10 SP1 安装 Qt 与构建
+
+当前工程使用 CMake 构建，优先查找 Qt6，找不到会自动回退到 Qt5。Kylin V10 SP1 新服务器
+`ID_LIKE=debian`，建议先安装 Qt5 开发包；Qt5 已满足本工程的 `Widgets` 和 `SerialPort` 需求。
+
+先确认系统包管理器：
+
+```sh
+cat /etc/os-release
+command -v apt || command -v dnf || command -v yum
+```
+
+如果存在 `apt`，按下面安装：
+
+```sh
+sudo apt update
+sudo apt install -y build-essential cmake ninja-build pkg-config \
+  qtbase5-dev qtbase5-dev-tools libqt5serialport5-dev
+```
+
+如果 Kylin 仓库提供 Qt6，也可以改装 Qt6 开发包；当前不是必须：
+
+```sh
+sudo apt install -y qt6-base-dev qt6-base-dev-tools libqt6serialport6-dev
+```
+
+如果这台机器实际使用 `dnf` 或 `yum`，使用 rpm 系包名：
+
+```sh
+sudo dnf install -y gcc gcc-c++ make cmake ninja-build pkgconf-pkg-config \
+  qt5-qtbase-devel qt5-qtserialport-devel
+
+# 没有 dnf 时再使用 yum
+sudo yum install -y gcc gcc-c++ make cmake ninja-build pkgconfig \
+  qt5-qtbase-devel qt5-qtserialport-devel
+```
+
+安装后检查 Qt 和 CMake 是否能被找到：
+
+```sh
+cmake --version
+pkg-config --modversion Qt5Core Qt5Widgets Qt5SerialPort
+```
+
+`qmake` 不是必须项；只要 CMake 能找到 `Qt5Widgets` 和 `Qt5SerialPort` 就可以构建。命令行构建：
 
 ```sh
 cd /home/zhe/app/pa_host
-cmake -S . -B build
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 ./build/pa_host
 ```
 
+如果系统没有安装 Ninja，可以使用默认 Makefiles：
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j$(nproc)
+```
+
+如果 CMake 仍然提示找不到 Qt，先查 Qt5 的 CMake 配置目录，再显式指定：
+
+```sh
+dpkg -L qtbase5-dev | grep '/cmake/Qt5$'
+cmake -S . -B build -DCMAKE_PREFIX_PATH=/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/cmake/Qt5
+```
+
+需要图形 IDE 时可以安装 Qt Creator，然后直接打开工程根目录的 `CMakeLists.txt`：
+
+```sh
+sudo apt install -y qtcreator
+```
+
 在 Makefiles/Ninja 这类单配置生成器下，如果没有显式指定，工程默认使用 `RelWithDebInfo`，即启用优化并保留调试符号。图像加载、窗宽窗位转换和 ROI 扫描不应使用空的 `CMAKE_BUILD_TYPE` 或未优化构建做性能判断。需要完整调试构建时显式使用 `-DCMAKE_BUILD_TYPE=Debug`。
 
-当前工程使用 CMake 构建，`qmake` 不是必须项。Kylin 上如果 `pkg-config --modversion Qt5Core Qt5Widgets Qt5SerialPort`
-能看到版本号，可以先直接尝试 CMake 构建。Qt Creator 可以直接打开 `CMakeLists.txt`，但会默认使用自己的
-shadow build 目录，例如 `/home/zhe/app/build-pa_host-Desktop-Default`，这属于正常构建产物。
+Qt Creator 会默认使用自己的 shadow build 目录，例如 `/home/zkyd/build-pa_host-Desktop-Default`，这属于正常构建产物，不需要提交到 git。
 
 ### Windows 构建与调试
 
@@ -218,14 +280,19 @@ Shift+左键拖框：按 ROI 重新计算窗位/窗宽
 ```text
 文件 -> 打开 TiRaw 图像：可一次选择一张或多张本地图像
 文件 -> 回放 TiRaw 序列：选择多张图像、设置 1~120 fps 后循环回放
-文件 -> 停止图像回放：停止本地回放
+文件 -> 停止动态模式：通过 RS422 发送 STOP_DYNC，不停止 PCIe 图像监听
 ```
 
-回放使用和未来 PCIe 相同的 `IImageSource -> ImageAcquisitionController -> FramePresentationController -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际显示 FPS。PCIe 尚未接入。
+软件启动后会自动开始 PCIe 图像监听，不需要手动点击开始按钮。监听逻辑是：从 `/dev/idma0_event_0` 等待图像中断，中断到达后立即写一条日志；从 BAR0 读取 image_id 和最终图像 DDR 地址；再从 `/dev/idma0_c2h_0` 读取 3072x7680 RAW16 图像。内存图像快速解析后立即进入显示队列，保存线程随后在后台保存为 `.tiraw` 文件，文件写完后再加入左侧图像列表。PCIe 图像默认保存到 Qt 应用数据目录下的 `pcie_images` 子目录。BAR0 会自动查找 vendor `0x1b4d`、device `0x6667` 的 `resource0`，并读取 image_id 和最终图像 DDR 地址作为帧来源信息。PCIe 日志中的阶段耗时含义为：`wait` 等待图像中断，`bar0` 读取帧元数据，`c2h` 读取 45 MiB RAW16 数据，`parse` 转成显示用内存图像，`emit_total` 从中断到进入显示队列，`queue` 保存线程排队时间，`save` 写 `.tiraw` 文件，`total` 从中断到文件保存完成；`PCIe 图像显示完成` 日志中的 `set_frame`、`controls`、`refresh`、`ui_total` 分别表示 UI 线程接收帧、控件同步、图像渲染刷新和 UI 总耗时。PCIe 监听是常驻图像入口，删除图片、切换历史图像、打开本地图像和发送 `STOP_DYNC` 都不会停止上图中断处理。
 
-普通图像列表只保存文件路径和缩略图，不常驻缓存所有 16-bit 原始图像。点击列表项时重新加载对应文件；选中一项或多项后，可点击“移除选中图像”、按 Delete，或使用右键菜单移除。移除只影响列表，不会删除磁盘上的源文件。
+本地回放和 PCIe 接收使用相同的 `IImageSource -> ImageAcquisitionController -> FramePresentationController -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际显示 FPS。
 
-本地回放针对当前固定的 2～3 帧使用预加载：开始回放时读取并解析一次原始图像，循环时复用内存帧；日志会记录成功预加载帧数和耗时。稳定的本地帧携带 `contentCacheKey`，主窗口最多缓存 4 张当前窗宽窗位下的 8-bit 显示图，`ImageView` 还会在 128 MiB 上限内缓存对应 `QPixmap`，避免无显卡或远程桌面环境反复做显示格式转换。未来 PCIe 动态帧默认不提供该键，因此不会按来源名误用旧缓存。首帧立即提交，后续显示节拍跟随用户设置的 1～120 fps；累计时间基准会自动补偿整数毫秒定时误差。处理速度跟不上输入时只保留最新帧并统计显示丢帧，不累积延迟。状态栏同时显示实际显示 fps 和目标 fps。全图 ROI 统计延迟到首帧提交后执行，并按稳定内容键缓存。调整窗宽窗位、停止或重新开始回放会自动清空相关缓存。
+普通图像列表保存文件路径、缩略图和最近使用的少量图像缓存。点击列表项时优先复用最近 12 张
+16-bit 原始帧；未命中时再快速读取预览数据。选中一项或多项后，可点击“移除选中图像”、按
+Delete，或使用右键菜单移除。移除只影响列表，不会删除磁盘上的源文件。PCIe 监听运行时，点击
+历史图像只切换当前显示，不会停止 `/dev/idma0_event_0` 的中断监听。
+
+本地回放针对当前固定的 2～3 帧使用预加载：开始回放时读取并解析一次原始图像，循环时复用内存帧；日志会记录成功预加载帧数和耗时。稳定的本地帧携带 `contentCacheKey`，主窗口最多缓存 12 张当前窗宽窗位下的 8-bit 显示图，`ImageView` 还会在 512 MiB 上限内缓存对应 `QPixmap`，避免无显卡或远程桌面环境反复做显示格式转换。实时 PCIe 动态帧默认不提供该键，因此不会按来源名误用旧缓存。首帧立即提交，后续显示节拍跟随用户设置的 1～120 fps；累计时间基准会自动补偿整数毫秒定时误差。处理速度跟不上输入时只保留最新帧并统计显示丢帧，不累积延迟。状态栏只显示实际显示 FPS。全图 ROI 统计延迟到首帧提交后执行，并按稳定内容键缓存。调整窗宽窗位、停止或重新开始回放会自动清空相关缓存。
 
 图像列表缩略图直接从 16-bit 原始像素降采样到目标尺寸，不再先生成一张完整的 8-bit 大图，因此打开多张大图或首次回放时的界面阻塞更小。
 
@@ -241,6 +308,12 @@ BMP / JPEG  导出当前窗宽窗位映射后的 8-bit 显示图像
 DCM 暂未实现。DICOM 需要明确设备、检查和图像元数据以及编码规范，不能只修改文件扩展名。
 
 配置会保存最近图像、保存、导出和诊断目录，以及最后成功连接的串口、波特率和命令超时。Kylin 使用 Qt 的用户配置目录，Windows 使用当前用户配置，工程目录不会生成配置文件。
+
+Kylin 新服务器使用 WCH RS422 串口，默认端口为 `/dev/ttyWCH0`，允许选择 `/dev/ttyWCH0`、`/dev/ttyWCH1`、`/dev/ttyWCH2`、`/dev/ttyWCH3`。如果需要在系统层面先配置串口，可执行：
+
+```sh
+sudo stty -F /dev/ttyWCH0 115200 raw -echo -echoe -echok -echoctl -echoke -crtscts -ixon -ixoff
+```
 
 ## 与 ARM 的当前协议
 
@@ -266,7 +339,7 @@ STOP_TRANSFER
 
 ```text
 OK PONG
-OK STATUS pa=0x00000000 com=0x00000000 rst=0x00000000 wr_state=0 wr_end=0 corr_state=0 corr_end=0
+OK STATUS int_vector=0x00000000 pa_version=0x00000000 com_version=0x00000000 rst_state=0x00000000 wr_state=0 wr_end=0 corr_state=0 corr_end=0
 ERR UNKNOWN
 ```
 

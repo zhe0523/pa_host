@@ -26,6 +26,20 @@ bool ImageSession::loadFile(const QString& path, QString* errorMessage) {
     return setFrame(frame, errorMessage);
 }
 
+bool ImageSession::loadFilePreview(const QString& path, QString* errorMessage) {
+    TiRawImage image;
+    if (!image.loadPreview(path, errorMessage)) {
+        return false;
+    }
+
+    ImageFrame frame;
+    frame.image = std::move(image);
+    frame.sourceName = QFileInfo(path).fileName();
+    frame.contentCacheKey = QFileInfo(path).absoluteFilePath();
+    frame.receivedAt = QDateTime::currentDateTimeUtc();
+    return setFrame(frame, errorMessage);
+}
+
 bool ImageSession::setFrame(const ImageFrame& frame, QString* errorMessage) {
     if (!frame.image.isValid()) {
         if (errorMessage != nullptr) {
@@ -70,6 +84,10 @@ WindowLevelResult ImageSession::roiWindowLevel(const QRect& roi) const {
 
 QImage ImageSession::render(int center, int width) const {
     return currentFrame_.image.toDisplayImage(false, center, width);
+}
+
+QImage ImageSession::render(int center, int width, const QSize& outputSize) const {
+    return currentFrame_.image.toDisplayImage(false, center, width, outputSize);
 }
 
 bool ImageSession::analyzeMtf(const QRect& roi, MtfAnalysisResult* result, double pixelSizeMm) const {

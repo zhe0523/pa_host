@@ -21,6 +21,7 @@ public:
     explicit ImageSession(std::shared_ptr<IImageAlgorithms> algorithms, QObject* parent = nullptr);
 
     bool loadFile(const QString& path, QString* errorMessage);
+    bool loadFilePreview(const QString& path, QString* errorMessage);
     bool setFrame(const ImageFrame& frame, QString* errorMessage);
     void clear();
     bool hasImage() const;
@@ -31,6 +32,7 @@ public:
     bool roiStats(const QRect& roi, TiRawImage::RoiStats* stats) const;
     WindowLevelResult roiWindowLevel(const QRect& roi) const;
     QImage render(int center, int width) const;
+    QImage render(int center, int width, const QSize& outputSize) const;
     bool analyzeMtf(const QRect& roi, MtfAnalysisResult* result, double pixelSizeMm = 0.1) const;
     bool exportMtf(const QString& directory, const MtfAnalysisResult& result, QString* errorMessage) const;
 

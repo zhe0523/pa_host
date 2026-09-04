@@ -2,6 +2,7 @@
 
 #include "ILineTransport.h"
 
+#include <initializer_list>
 #include <limits>
 
 namespace {
@@ -37,6 +38,23 @@ bool readIntField(
     }
     *value = parsed;
     return true;
+}
+
+bool readUnsignedFieldAny(
+    const QMap<QString, QString>& fields,
+    std::initializer_list<QString> keys,
+    quint32* value,
+    bool required = true) {
+    for (const QString& key : keys) {
+        if (readUnsignedField(fields, key, value)) {
+            return true;
+        }
+    }
+    if (!required && value != nullptr) {
+        *value = 0;
+        return true;
+    }
+    return false;
 }
 }
 
@@ -110,7 +128,8 @@ bool PaDeviceController::sendCommand(
         setState(PaDeviceState::Disconnected);
         return rejectOperation(QStringLiteral("串口未连接"), errorMessage);
     }
-    if (command == PaProtocol::Command::StopTransfer) {
+    if (command == PaProtocol::Command::StopTransfer
+        || command == PaProtocol::Command::StopDynamic) {
         return sendImmediateCommand(command, errorMessage);
     }
     if (pendingCommand_.has_value()) {
@@ -145,7 +164,7 @@ bool PaDeviceController::sendCommand(
 bool PaDeviceController::sendImmediateCommand(
     PaProtocol::Command command,
     QString* errorMessage) {
-    // STOP_TRANSFER 无需响应，并会取消本地对上一条上图命令的等待。
+    // 停止类命令只负责尽快写到 ARM，不等待响应，避免停止入口被在途命令卡住。
     commandTimer_.stop();
     pendingCommand_.reset();
     setState(PaDeviceState::Busy);
@@ -310,9 +329,10 @@ bool PaDeviceController::parseDeviceStatus(
     parsed.serialNumber = response.kv.value(QStringLiteral("serial")).trimmed();
     parsed.armVersion = response.kv.value(QStringLiteral("arm_version")).trimmed();
     parsed.fpgaVersion = response.kv.value(QStringLiteral("fpga_version")).trimmed();
-    const bool valid = readUnsignedField(response.kv, QStringLiteral("pa"), &parsed.paFlags)
-        && readUnsignedField(response.kv, QStringLiteral("com"), &parsed.communicationFlags)
-        && readUnsignedField(response.kv, QStringLiteral("rst"), &parsed.resetFlags)
+    const bool valid = readUnsignedFieldAny(response.kv, {QStringLiteral("int_vector"), QStringLiteral("int")}, &parsed.interruptVector, false)
+        && readUnsignedFieldAny(response.kv, {QStringLiteral("pa_version"), QStringLiteral("pa")}, &parsed.paVersion)
+        && readUnsignedFieldAny(response.kv, {QStringLiteral("com_version"), QStringLiteral("com")}, &parsed.communicationVersion)
+        && readUnsignedFieldAny(response.kv, {QStringLiteral("rst_state"), QStringLiteral("rst")}, &parsed.resetState)
         && readIntField(response.kv, QStringLiteral("wr_state"), &parsed.writeState)
         && readIntField(response.kv, QStringLiteral("wr_end"), &parsed.writeEnd)
         && readIntField(response.kv, QStringLiteral("corr_state"), &parsed.correctionState)

@@ -18,9 +18,10 @@ enum class PaDeviceState {
 
 struct PaDeviceStatus {
     bool valid = false;
-    quint32 paFlags = 0;
-    quint32 communicationFlags = 0;
-    quint32 resetFlags = 0;
+    quint32 interruptVector = 0;
+    quint32 paVersion = 0;
+    quint32 communicationVersion = 0;
+    quint32 resetState = 0;
     int writeState = -1;
     int writeEnd = -1;
     int correctionState = -1;

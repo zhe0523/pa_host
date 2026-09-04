@@ -36,6 +36,7 @@ class ImageListPanel;
 class AppLogService;
 class AppSettings;
 class PaDeviceController;
+class PcieImageSource;
 enum class PaDeviceState;
 
 /*
@@ -56,7 +57,9 @@ public:
 private slots:
     void openImage();
     void startImageReplay();
+    void startPcieCapture();
     void stopImageReplay();
+    void stopDynamicMode();
     void saveDisplayImage();
     void connectSerial();
     void disconnectSerial();
@@ -102,6 +105,7 @@ private:
     std::unique_ptr<ImageSession> imageSession_;
     AppLogService* logService_ = nullptr;
     LocalReplaySource* replaySource_ = nullptr;
+    PcieImageSource* pcieSource_ = nullptr;
     ImageAcquisitionController* acquisitionController_ = nullptr;
     PaDeviceController* deviceController_ = nullptr;
     ImageTransferWorkflowController* imageTransferController_ = nullptr;
@@ -148,10 +152,18 @@ private:
 
     QTimer imageRefreshTimer_;
     QTimer imageInfoRefreshTimer_;
+    /*
+     * 历史图像切换性能缓存：
+     * - imageFrameCache_ 保存最近若干张 16-bit 原始帧，避免重复从磁盘读取和解析。
+     * - frameDisplayCache_ 保存当前窗宽窗位映射后的 8-bit 显示图，避免重复做灰度映射。
+     * - stableFrameStatsCache_ 保存稳定文件帧的 ROI/全图统计，避免切回来后再次扫全图。
+     */
+    QCache<QString, ImageFrame> imageFrameCache_;
     QCache<QString, QImage> frameDisplayCache_;
     QHash<QString, TiRawImage::RoiStats> stableFrameStatsCache_;
     QElapsedTimer imageInfoTimer_;
     QRect activeRoi_;
+    QSize lastDisplayRenderSize_;
     QString armProgramVersion_;
     QString fpgaVersion_;
     bool resetViewStateOnRefresh_ = false;

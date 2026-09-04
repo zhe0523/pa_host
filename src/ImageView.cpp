@@ -10,8 +10,14 @@
 #include <cmath>
 
 namespace {
-constexpr int kPixmapCacheMiB = 128;
+/*
+ * 实机内存较大，列表来回切换时允许用一部分内存缓存全尺寸 QPixmap。
+ * 这样可以避免每次都把 8-bit QImage 重新转换成窗口系统使用的 pixmap。
+ */
+constexpr int kPixmapCacheMiB = 512;
 constexpr qint64 kBytesPerMiB = 1024 * 1024;
+constexpr qreal kMaxZoom = 128.0;
+constexpr qreal kMinZoom = 0.02;
 
 int pixmapCostMiB(const QPixmap& pixmap) {
     const int bytesPerPixel = pixmap.depth() <= 8
@@ -46,9 +52,10 @@ ImageView::ImageView(QWidget* parent)
     viewport()->setMouseTracking(true);
 }
 
-void ImageView::setImage(const QImage& image, bool resetViewState) {
+void ImageView::setImage(const QImage& image, bool resetViewState, const QSize& logicalImageSize) {
     const bool sizeChanged = image_.size() != image.size();
     image_ = image;
+    logicalImageSize_ = logicalImageSize.isValid() ? logicalImageSize : image.size();
 
     if (resetViewState && roiItem_ != nullptr) {
         clearRoiOverlay();
@@ -58,6 +65,7 @@ void ImageView::setImage(const QImage& image, bool resetViewState) {
         scene_.clear();
         pixmapItem_ = nullptr;
         roiItem_ = nullptr;
+        logicalImageSize_ = {};
         return;
     }
 
@@ -79,9 +87,10 @@ void ImageView::setImage(const QImage& image, bool resetViewState) {
         roiItem_ = nullptr;
         pixmapItem_ = scene_.addPixmap(pixmap);
         pixmapItem_->setTransformationMode(Qt::FastTransformation);
-        scene_.setSceneRect(pixmapItem_->boundingRect());
+        updateSceneRectForPanning();
     } else {
         pixmapItem_->setPixmap(pixmap);
+        updateSceneRectForPanning();
     }
 
     if (resetViewState || sizeChanged) {
@@ -122,13 +131,13 @@ int ImageView::zoomPercent() const {
 
 void ImageView::zoomIn() {
     fitMode_ = false;
-    zoom_ = std::min<qreal>(zoom_ * 1.25, 32.0);
+    zoom_ = std::min<qreal>(zoom_ * 1.25, kMaxZoom);
     applyTransform();
 }
 
 void ImageView::zoomOut() {
     fitMode_ = false;
-    zoom_ = std::max<qreal>(zoom_ / 1.25, 0.02);
+    zoom_ = std::max<qreal>(zoom_ / 1.25, kMinZoom);
     applyTransform();
 }
 
@@ -151,7 +160,7 @@ void ImageView::fitToWindow() {
 
     constexpr qreal margin = 0.96;
     zoom_ = std::max<qreal>(
-        0.02,
+        kMinZoom,
         std::min(viewSize.width() / targetWidth, viewSize.height() / targetHeight) * margin);
     fitMode_ = true;
     applyTransform();
@@ -203,13 +212,14 @@ void ImageView::mousePressEvent(QMouseEvent* event) {
         if (imagePoint.x() >= 0) {
             selectionMode_ = analysisSelection ? SelectionMode::Analysis : SelectionMode::WindowLevel;
             roiStart_ = imagePoint;
+            roiStartDisplay_ = displayPointAt(event->pos());
             setDragMode(QGraphicsView::NoDrag);
             if (roiItem_ == nullptr) {
                 roiItem_ = scene_.addRect(QRectF(), roiPen(QColor(255, 230, 0)), Qt::NoBrush);
                 roiItem_->setZValue(10.0);
             }
             roiItem_->setPen(roiPen(selectionMode_ == SelectionMode::Analysis ? QColor(255, 125, 0) : QColor(36, 170, 84)));
-            roiItem_->setRect(QRectF(roiStart_, QSizeF(1, 1)));
+            roiItem_->setRect(QRectF(roiStartDisplay_, QSizeF(1, 1)));
             event->accept();
             return;
         }
@@ -228,8 +238,9 @@ void ImageView::mouseMoveEvent(QMouseEvent* event) {
     emit pixelHovered(imagePoint);
 
     if (selectionMode_ != SelectionMode::None) {
-        if (imagePoint.x() >= 0 && roiItem_ != nullptr) {
-            roiItem_->setRect(QRectF(roiStart_, imagePoint).normalized());
+        const QPointF displayPoint = displayPointAt(event->pos());
+        if (imagePoint.x() >= 0 && displayPoint.x() >= 0.0 && roiItem_ != nullptr) {
+            roiItem_->setRect(QRectF(roiStartDisplay_, displayPoint).normalized());
         }
         event->accept();
         return;
@@ -284,6 +295,7 @@ void ImageView::wheelEvent(QWheelEvent* event) {
 
 void ImageView::resizeEvent(QResizeEvent* event) {
     QGraphicsView::resizeEvent(event);
+    updateSceneRectForPanning();
     if (fitMode_ && pixmapItem_ != nullptr) {
         fitToWindow();
     }
@@ -306,14 +318,34 @@ void ImageView::drawBackground(QPainter* painter, const QRectF& rect) {
 }
 
 QPoint ImageView::imagePointAt(const QPoint& viewPoint) const {
+    return logicalPointFromDisplay(displayPointAt(viewPoint));
+}
+
+QPointF ImageView::displayPointAt(const QPoint& viewPoint) const {
     if (image_.isNull()) {
-        return {-1, -1};
+        return {-1.0, -1.0};
     }
 
     const QPointF scenePoint = mapToScene(viewPoint);
-    const int x = static_cast<int>(std::floor(scenePoint.x()));
-    const int y = static_cast<int>(std::floor(scenePoint.y()));
-    if (x < 0 || y < 0 || x >= image_.width() || y >= image_.height()) {
+    const QRectF imageRect = pixmapItem_ != nullptr
+        ? pixmapItem_->boundingRect()
+        : QRectF(QPointF(0.0, 0.0), QSizeF(image_.size()));
+    if (!imageRect.contains(scenePoint)) {
+        return {-1.0, -1.0};
+    }
+    return scenePoint;
+}
+
+QPoint ImageView::logicalPointFromDisplay(const QPointF& displayPoint) const {
+    if (image_.isNull() || logicalImageSize_.isEmpty() || displayPoint.x() < 0.0 || displayPoint.y() < 0.0) {
+        return {-1, -1};
+    }
+
+    const qreal scaleX = static_cast<qreal>(logicalImageSize_.width()) / std::max(1, image_.width());
+    const qreal scaleY = static_cast<qreal>(logicalImageSize_.height()) / std::max(1, image_.height());
+    const int x = static_cast<int>(std::floor(displayPoint.x() * scaleX));
+    const int y = static_cast<int>(std::floor(displayPoint.y() * scaleY));
+    if (x < 0 || y < 0 || x >= logicalImageSize_.width() || y >= logicalImageSize_.height()) {
         return {-1, -1};
     }
     return {x, y};
@@ -335,8 +367,27 @@ QTransform ImageView::imageTransform(qreal zoom) const {
     return transform;
 }
 
+void ImageView::updateSceneRectForPanning() {
+    if (pixmapItem_ == nullptr) {
+        return;
+    }
+
+    /*
+     * QGraphicsView 的拖拽范围受 sceneRect 限制。sceneRect 如果只等于图像边界，
+     * 放大后平移会在图像边缘立刻被卡住。这里给场景保留足够大的空白区，
+     * 让用户可以把图像继续拖到视口任意位置附近。
+     */
+    const QRectF imageRect = pixmapItem_->boundingRect();
+    const QRectF visibleSceneRect = mapToScene(viewport()->rect()).boundingRect();
+    const qreal viewportExtent = std::max(visibleSceneRect.width(), visibleSceneRect.height());
+    const qreal imageExtent = std::max(imageRect.width(), imageRect.height());
+    const qreal margin = std::max<qreal>(4096.0, std::max(imageExtent * 20.0, viewportExtent * 20.0));
+    scene_.setSceneRect(imageRect.adjusted(-margin, -margin, margin, margin));
+}
+
 void ImageView::applyTransform() {
     setTransform(imageTransform(zoom_));
+    updateSceneRectForPanning();
     updateZoomLabel();
 }
 

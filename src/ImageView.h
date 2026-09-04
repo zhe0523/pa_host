@@ -8,6 +8,7 @@
 #include <QImage>
 #include <QPoint>
 #include <QRect>
+#include <QSize>
 #include <QTransform>
 
 /*
@@ -22,7 +23,7 @@ class ImageView : public QGraphicsView {
 public:
     explicit ImageView(QWidget* parent = nullptr);
 
-    void setImage(const QImage& image, bool resetViewState = false);
+    void setImage(const QImage& image, bool resetViewState = false, const QSize& logicalImageSize = QSize());
     void setPixmapCacheEnabled(bool enabled);
     void clearPixmapCache();
     bool hasImage() const;
@@ -56,8 +57,11 @@ protected:
 
 private:
     QPoint imagePointAt(const QPoint& viewPoint) const;
+    QPointF displayPointAt(const QPoint& viewPoint) const;
+    QPoint logicalPointFromDisplay(const QPointF& displayPoint) const;
     QTransform imageTransform(qreal zoom) const;
     void clearRoiOverlay();
+    void updateSceneRectForPanning();
     void applyTransform();
     void updateZoomLabel();
 
@@ -72,6 +76,11 @@ private:
     QGraphicsRectItem* roiItem_ = nullptr;
     QCache<qint64, QPixmap> pixmapCache_;
     QImage image_;
+    /*
+     * 实时 PCIe 上图可以用降采样图像显示，但鼠标像素和 ROI 必须仍然回到
+     * 原始 16-bit 图像坐标。logicalImageSize_ 记录原始帧尺寸，image_ 是当前显示尺寸。
+     */
+    QSize logicalImageSize_;
     qreal zoom_ = 1.0;
     int rotation_ = 0;
     bool flipH_ = false;
@@ -80,4 +89,5 @@ private:
     bool pixmapCacheEnabled_ = false;
     SelectionMode selectionMode_ = SelectionMode::None;
     QPoint roiStart_;
+    QPointF roiStartDisplay_;
 };

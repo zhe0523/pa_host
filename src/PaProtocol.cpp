@@ -25,6 +25,8 @@ QString PaProtocol::commandText(Command command) {
         return "START_CONTINUOUS";
     case Command::StopTransfer:
         return "STOP_TRANSFER";
+    case Command::StopDynamic:
+        return "STOP_DYNC";
     }
     return QString();
 }
@@ -51,6 +53,8 @@ QString PaProtocol::commandName(Command command) {
         return QStringLiteral("开始持续上图");
     case Command::StopTransfer:
         return QStringLiteral("停止上图");
+    case Command::StopDynamic:
+        return QStringLiteral("停止动态模式");
     }
     return QStringLiteral("未知命令");
 }
@@ -67,6 +71,7 @@ QStringList PaProtocol::commandNames() {
         commandText(Command::SendSingle),
         commandText(Command::StartContinuous),
         commandText(Command::StopTransfer),
+        commandText(Command::StopDynamic),
     };
 }
 
@@ -92,7 +97,7 @@ PaProtocol::Response PaProtocol::parseResponse(const QString& line) {
 
     /*
      * ARM STATUS 响应形如：
-     * OK STATUS pa=0x... com=0x... wr_state=...
+     * OK STATUS pa_version=0x... com_version=0x... wr_state=...
      *
      * 这里按 key=value 泛化解析，避免 UI 依赖固定字段顺序。
      */

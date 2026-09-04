@@ -27,7 +27,8 @@ public:
         StartCorrection,
         SendSingle,
         StartContinuous,
-        StopTransfer
+        StopTransfer,
+        StopDynamic
     };
 
     struct Response {

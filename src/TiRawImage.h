@@ -37,7 +37,9 @@ public:
     };
 
     bool load(const QString& path, QString* errorMessage);
+    bool loadPreview(const QString& path, QString* errorMessage);
     bool loadData(const QByteArray& data, const QString& sourceName, QString* errorMessage);
+    bool loadRaw16Data(const QByteArray& data, int width, int height, const QString& sourceName, QString* errorMessage);
     bool saveTiRaw(const QString& path, QString* errorMessage) const;
     bool saveRaw16(const QString& path, QString* errorMessage) const;
     bool isValid() const;
@@ -65,9 +67,15 @@ public:
 
 private:
     bool savePixelData(const QString& path, bool includeHeader, QString* errorMessage) const;
+    bool loadDataInternal(
+        const QByteArray& data,
+        const QString& sourceName,
+        bool previewStats,
+        QString* errorMessage);
     static quint16 readLe16(const uchar* p);
     void updateRange();
     void updateAutoWindowLevel();
+    void updatePreviewRangeAndAutoWindowLevel(int maxSamples);
 
     QString path_;
     quint16 version_ = 0;

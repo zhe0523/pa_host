@@ -80,7 +80,7 @@ STOP_TRANSFER
 
 ```text
 OK PONG
-OK STATUS pa=0x00000000 com=0x00000000 rst=0x00000000 wr_state=0 wr_end=0 corr_state=0 corr_end=0 model=PA-01 serial=SN0001 arm_version=1.0.0 fpga_version=1.0.0
+OK STATUS int_vector=0x00000000 pa_version=0x00000000 com_version=0x00000000 rst_state=0x00000000 wr_state=0 wr_end=0 corr_state=0 corr_end=0 model=PA-01 serial=SN0001 arm_version=1.0.0 fpga_version=1.0.0
 ERR UNKNOWN
 ```
 

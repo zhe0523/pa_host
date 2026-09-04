@@ -217,19 +217,20 @@ bool testProtocolCommands() {
     CHECK(PaProtocol::commandText(PaProtocol::Command::SendSingle) == QStringLiteral("SEND_SINGLE"));
     CHECK(PaProtocol::commandText(PaProtocol::Command::StartContinuous) == QStringLiteral("START_CONTINUOUS"));
     CHECK(PaProtocol::commandText(PaProtocol::Command::StopTransfer) == QStringLiteral("STOP_TRANSFER"));
+    CHECK(PaProtocol::commandText(PaProtocol::Command::StopDynamic) == QStringLiteral("STOP_DYNC"));
     CHECK(PaProtocol::commandName(PaProtocol::Command::SendSingle) == QStringLiteral("手动上图"));
-    CHECK(PaProtocol::commandNames().size() == 10);
+    CHECK(PaProtocol::commandNames().size() == 11);
     return true;
 }
 
 bool testProtocolResponses() {
     const auto status = PaProtocol::parseResponse(
-        QStringLiteral("  OK   STATUS pa=0x10 wr_state=2 corr_end=1  \r\n"));
+        QStringLiteral("  OK   STATUS pa_version=0x10 wr_state=2 corr_end=1  \r\n"));
     CHECK(status.ok);
     CHECK(!status.error);
     CHECK(status.keyword == QStringLiteral("STATUS"));
-    CHECK(status.rawLine == QStringLiteral("OK   STATUS pa=0x10 wr_state=2 corr_end=1"));
-    CHECK(status.kv.value(QStringLiteral("pa")) == QStringLiteral("0x10"));
+    CHECK(status.rawLine == QStringLiteral("OK   STATUS pa_version=0x10 wr_state=2 corr_end=1"));
+    CHECK(status.kv.value(QStringLiteral("pa_version")) == QStringLiteral("0x10"));
     CHECK(status.kv.value(QStringLiteral("wr_state")) == QStringLiteral("2"));
     CHECK(status.kv.value(QStringLiteral("corr_end")) == QStringLiteral("1"));
 
@@ -253,6 +254,9 @@ bool testAppSettings() {
 
     {
         AppSettings settings(settingsPath);
+#ifndef Q_OS_WIN
+        CHECK(settings.serialPort() == QStringLiteral("/dev/ttyWCH0"));
+#endif
         CHECK(settings.serialBaudRate() == 115200);
         CHECK(settings.commandTimeoutMs() == 5000);
         settings.setLastImageDirectory(QStringLiteral("/tmp/images"));
@@ -389,7 +393,7 @@ bool testPaDeviceController() {
     CHECK(controller.state() == PaDeviceState::Busy);
 
     transport.injectLine(QStringLiteral(
-        "OK STATUS pa=0x20 com=3 rst=4 wr_state=2 wr_end=1 corr_state=5 corr_end=0 "
+        "OK STATUS int_vector=0x10 pa_version=0x20 com_version=3 rst_state=4 wr_state=2 wr_end=1 corr_state=5 corr_end=0 "
         "model=PA-01 serial=SN0001 arm_version=1.2.3 fpga_version=4.5.6"));
     CHECK(controller.state() == PaDeviceState::Ready);
     CHECK(!controller.hasPendingCommand());
@@ -398,7 +402,10 @@ bool testPaDeviceController() {
     CHECK(results.last().success);
     CHECK(statuses.size() == 1);
     CHECK(statuses.last().valid);
-    CHECK(statuses.last().paFlags == 0x20);
+    CHECK(statuses.last().interruptVector == 0x10);
+    CHECK(statuses.last().paVersion == 0x20);
+    CHECK(statuses.last().communicationVersion == 3);
+    CHECK(statuses.last().resetState == 4);
     CHECK(statuses.last().writeState == 2);
     CHECK(statuses.last().correctionState == 5);
     CHECK(statuses.last().model == QStringLiteral("PA-01"));
@@ -410,6 +417,7 @@ bool testPaDeviceController() {
     transport.injectLine(QStringLiteral(
         "OK STATUS pa=0x21 com=3 rst=4 wr_state=2 wr_end=1 corr_state=5 corr_end=0"));
     CHECK(statuses.size() == 2);
+    CHECK(statuses.last().paVersion == 0x21);
     CHECK(controller.hasPendingCommand());
     CHECK(controller.state() == PaDeviceState::Busy);
     transport.injectLine(QStringLiteral("OK PONG"));
@@ -645,6 +653,19 @@ bool testTirawParsingAndRoi() {
     CHECK(memoryImage.height() == 3);
     CHECK(memoryImage.pixelValue(2, 1, &value));
     CHECK(value == 70);
+
+    QByteArray raw16;
+    for (const quint16 pixel : pixels) {
+        appendLe16(&raw16, pixel);
+    }
+    TiRawImage rawImage;
+    CHECK(rawImage.loadRaw16Data(raw16, 4, 3, QStringLiteral("pcie-raw16"), &error));
+    CHECK(rawImage.path() == QStringLiteral("pcie-raw16"));
+    CHECK(rawImage.bytesPerPixel() == 2);
+    CHECK(rawImage.width() == 4);
+    CHECK(rawImage.height() == 3);
+    CHECK(rawImage.pixelValue(3, 2, &value));
+    CHECK(value == 120);
 
     const QString exportedTirawPath = directory.filePath(QStringLiteral("exported.tiraw"));
     const QString exportedRawPath = directory.filePath(QStringLiteral("exported.raw"));
