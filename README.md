@@ -6,11 +6,12 @@
 
 ```text
 RS422 与 ARM pa_controller 通讯
-发送 PA/FPGA 控制命令
+提供图像采集、校准和设备参数配置
 显示 ARM 返回状态
 打开和查看本地 .tiraw 图像
 提供旧上位机风格的图像交互和 ROI 分析入口
-后续接入光口图像接收链路
+PCIe 光口图像接收链路
+按下位机正式协议进行 RS422 二进制联调
 ```
 
 ## 目录
@@ -22,7 +23,7 @@ src/AppSettings.*    最近目录、串口参数和命令超时配置
 src/ImageListPanel.* 左侧图像列表、缩略图、选择、移除和右键菜单
 src/ImageExportService.* 原始图像和显示图像导出服务
 src/ImageAlgorithms.* 图像算法接口和当前内置实现，旧算法从这里替换
-src/ImageSource.*    图像源抽象和本地 .tiraw 连续回放实现
+src/ImageSource.*    图像源抽象接口（供 PCIe 图像源和统一显示链路使用）
 src/ImageAcquisitionController.* 图像源会话、状态、停止顺序和统计汇总
 src/ImageTransferWorkflowController.* 手动/持续上图模式和客户按钮状态
 src/ImageSession.*   当前图像帧、显示渲染和算法调用的应用层边界
@@ -31,7 +32,8 @@ src/ReplayPresentationScheduler.* 1～120 fps 显示时间调度策略
 src/PaDeviceController.* RS422 设备状态、命令生命周期、响应和超时管理
 src/ILineTransport.* 控制链路的按行传输接口，支持模拟传输测试
 src/SerialClient.*   RS422 串口按行收发
-src/PaProtocol.*     当前 ARM ASCII 命令和响应解析
+src/PaProtocol.*     研发调试用 ASCII 命令和响应解析
+src/PaBinaryProtocol.* RS422 正式二进制帧、CRC 和拆包/粘包解析
 src/TiRawImage.*     Windows 样例 .tiraw 16-bit 灰度图读取、自动窗宽窗位、ROI 统计
 src/ImageView.*      图像显示、缩放、平移、ROI 框选、保存
 doc/kylin-handover.md 给 Kylin 机器继续开发时看的交接文档
@@ -191,7 +193,6 @@ ReplayPresentationScheduler 60 fps 补偿、迟到追帧和帧率边界
 FramePresentationController 最新帧覆盖、停止丢帧和统计周期重置
 ImageAcquisitionController 启停、首帧、源销毁、自然结束和迟到帧隔离
 ImageTransferWorkflowController 模式选择、单帧、持续启动、停止和错误恢复
-LocalReplaySource 帧序号、停止状态、快速重启、坏文件跳过和统计
 ESF / LSF / MTF 基础分析与 CSV 导出
 ```
 
@@ -209,7 +210,75 @@ pa_image_benchmark 真实 TiRaw 性能基准工具
 
 `MainWindow` 只负责模块组装和跨模块工作流：图像列表内部行为由 `ImageListPanel` 管理，文件编码由 `ImageExportService` 管理，客户上图按钮由 `ImageTransferWorkflowController` 管理，图像源启停和会话统计由 `ImageAcquisitionController` 管理，显示限速由 `FramePresentationController` 管理，纯时间计算由 `ReplayPresentationScheduler` 管理。主窗口不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
 
-RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命令、响应和 5 秒超时；`MainWindow` 不再解析 ASCII 响应。未连接或命令执行中时，PA/FPGA 命令会自动禁用。设备返回有效响应、发生超时或传输错误后，控制器会统一恢复或切换错误状态。错误状态下如果串口仍保持打开，可以直接重试命令。
+RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命令、响应和超时。
+主机默认使用兼容 ASCII 调试模式；正式联调必须使用 `--binary`，此时串口收发全部是
+下位机正式二进制帧，主机不会把命令回退成 ASCII。设备返回有效响应、发生超时或传输错误后，
+控制器会统一恢复或切换错误状态。
+
+### RS422 正式二进制联调
+
+ARM 端的正式入口是 `pa_controller --binary`，不是 `--stdio`。`--stdio` 只用于在开发板上
+测试 ASCII 调试命令；ASCII 命令和正式上位机协议不是同一套接口。
+
+下位机先在 Ubuntu/Kylin 上编译并部署，然后在开发板运行：
+
+```sh
+./pa_controller --binary -d /dev/ttyS1 -b 115200
+```
+
+主机端运行：
+
+```sh
+./pa_host --binary
+```
+
+Windows 下对应为：
+
+```bat
+pa_host.exe --binary
+```
+
+打开主机后选择实际 RS422 端口和波特率，点击连接。连接成功后主机会自动发送一次二进制
+`STATUS`，因此可以先观察“运行日志”中的 `BIN REQ`、`BIN RX` 和结构化状态更新。
+当前已接入并可直接测试的二进制命令如下：
+
+| 命令 | 编号 | 主机触发方式 | 说明 |
+| --- | ---: | --- | --- |
+| `HELLO` | `0x0001` | 协议基础能力 | ARM 已支持，主机当前保留协议层解析入口 |
+| `PING` | `0x0002` | 开发窗口/协议基础 | 空 payload，返回 `DONE` |
+| `STATUS` | `0x0003` | 连接后自动读取 | 返回设备和工作状态 TLV |
+| `VERSION` | `0x0004` | 协议基础能力 | ARM 已支持，用于版本信息读取 |
+| `START_STATIC_CAPTURE` | `0x0200` | 手动上图 | 使用 ARM 当前配置执行一次静态采图 |
+| `START_DYNAMIC` | `0x0210` | 开始上图 | 使用配置文件中的 Dynamic step 启动 |
+| `STOP_DYNAMIC` | `0x0211` | 停止动态模式/停止上图 | 等待 Dynamic 回到停止状态 |
+| `QUERY_DYNAMIC` | `0x0212` | 工具 -> Dynamic 查询 | 显示状态、结束/调试值和最终图像地址 |
+| `CAL_OFFSET_*` | `0x0300`~`0x0303` | 校准 -> 制作暗场模板 | 初始化、采集、完成确认和取消 |
+| `CAL_GAIN_*` | `0x0304`~`0x0307` | 校准 -> 制作亮场模板 | 多灰度级初始化、逐级采集、生成和取消 |
+| `CAL_STATUS` | `0x0308` | 校准窗口自动轮询 | 返回后台任务进度和亮场级别状态 |
+| `IMG_UPLOAD_*` | `0x0500`~`0x0502` | 校准 -> 查看当前暗/亮场模板 | 配置模板源、触发上传并查询状态 |
+
+配置组命令由“工具 -> 开发”和“工具 -> Dynamic 配置”窗口使用：
+
+| 命令 | 编号 | 作用 |
+| --- | ---: | --- |
+| `GET_CONFIG_GROUP` | `0x0103` | 读取一组当前参数 |
+| `SET_CONFIG_GROUP` | `0x0104` | 校验、应用并保存一组参数 |
+
+配置组 payload 为 `u16 group_id` 加连续的 `{u16 item_id, u16 length=4, u32 value}` 小端字段。
+当前组号为 `1=Static`、`2=CORR`、`3=GIC`、`4=ROIC`、`5=Dynamic`。
+
+主机二进制模式已放行基础查询、静态单帧、Dynamic 启停/查询、配置组读写、Offset/Gain
+模板制作和模板上传。模板上传复用常驻 PCIe 图像监听，收到的下一帧会标记为当前暗场或亮场模板并显示。
+
+协议帧使用小端字段：`magic=0x55AA`、`version=1`、`header_len=16`、CRC16-CCITT-FALSE，
+payload 最大 2048 字节。空 payload 的 `PING` 请求固定测试帧为：
+
+```text
+AA 55 01 10 01 00 02 00 01 00 00 00 00 00 00 00 B7 D3
+```
+
+实际联调时，主机日志中的 `BIN RX` 会显示帧类型、命令号、序号和 payload；如果看不到
+`BIN RX`，先检查 RS422 端口、交叉收发线、波特率和 ARM 是否确实以 `--binary` 启动。
 
 运行日志由 `AppLogService` 统一生成，格式包含时间、级别和来源，并写入应用数据目录下的 `logs/pa_host.log`。单个文件默认最多 5 MiB，保留 5 个归档。通过“视图 -> 运行日志”打开底部日志 Dock；“工具 -> 导出诊断信息”生成包含运行环境、控制参数和文本日志的诊断文件，不包含图像像素。“工具 -> 命令超时设置”可调整并保存响应超时。
 
@@ -224,7 +293,7 @@ RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命�
 当前版本已经把旧 Windows 上位机里最常用的一段图像查看工作流补齐：
 
 ```text
-顶部菜单：文件 / RS422 / PA/FPGA / 视图 / 工具 / 帮助
+顶部菜单：文件 / RS422 / 校准 / 视图 / 工具 / 帮助
 顶部模式条：Idle / Continuous / 手动上图 / 停止上图
 左侧：带缩略图的图像列表，可点击切换和移除
 中间：图像画布
@@ -237,8 +306,7 @@ RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命�
 未返回对应字段时显示“未获取”。
 
 没有图像时，保存、最大化、右侧图像操作和窗宽窗位控件均禁用；自动窗宽窗位开启时，
-手动窗位/窗宽控件禁用。停止回放后状态栏恢复“显示 FPS: --”，不保留已经停止会话的
-目标帧率。型号和序列号可由 `STATUS` 的可选 `model`、`serial` 字段更新。
+手动窗位/窗宽控件禁用。型号和序列号可由 `STATUS` 的可选 `model`、`serial` 字段更新。
 
 顶部模式条是正式用户上图入口：
 
@@ -253,7 +321,7 @@ RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命�
 模式选择和开始操作分开，保证客户明确确认后才开始传图。持续上图运行期间模式和开始按钮
 锁定，只保留停止按钮；开始命令等待响应时也可以点击停止。`STOP_TRANSFER` 写出后不等待
 设备回包，上位机立即取消原命令的本地等待和超时计时，恢复模式选择及开始按钮。停止后
-保留 Continuous 选择，允许再次开始。`PA/FPGA` 原始命令
+保留 Continuous 选择，允许再次开始。旧的底层调试命令
 菜单和“运行日志”当前仅用于研发及维护联调，正式用户流程不依赖这些入口。
 
 所有不可执行的顶部按钮必须显示为灰色；保持蓝色或绿色的按钮必须能够立即响应点击。
@@ -272,29 +340,27 @@ Shift+左键拖框：按 ROI 重新计算窗位/窗宽
 ```
 
 “保存显示图像”会保存当前窗宽窗位、旋转和翻转后的图像方向；缩放倍率和平移仅属于查看
-状态，不写入输出文件。连续回放中保留 ROI 框时，下方统计随当前帧继续按该 ROI 更新；
+状态，不写入输出文件。连续接收中保留 ROI 框时，下方统计随当前帧继续按该 ROI 更新；
 清除框或切换图像后恢复全图统计。
 
 图像输入：
 
 ```text
-文件 -> 打开 TiRaw 图像：可一次选择一张或多张本地图像
-文件 -> 回放 TiRaw 序列：选择多张图像、设置 1~120 fps 后循环回放
-文件 -> 停止动态模式：通过 RS422 发送 STOP_DYNC，不停止 PCIe 图像监听
+文件 -> 打开图像：可一次选择一张或多张本地 `.tiraw` 图像
 ```
 
-软件启动后会自动开始 PCIe 图像监听，不需要手动点击开始按钮。监听逻辑是：从 `/dev/idma0_event_0` 等待图像中断，中断到达后立即写一条日志；从 BAR0 读取 image_id 和最终图像 DDR 地址；再从 `/dev/idma0_c2h_0` 读取 3072x7680 RAW16 图像。内存图像快速解析后立即进入显示队列，保存线程随后在后台保存为 `.tiraw` 文件，文件写完后再加入左侧图像列表。PCIe 图像默认保存到 Qt 应用数据目录下的 `pcie_images` 子目录。BAR0 会自动查找 vendor `0x1b4d`、device `0x6667` 的 `resource0`，并读取 image_id 和最终图像 DDR 地址作为帧来源信息。PCIe 日志中的阶段耗时含义为：`wait` 等待图像中断，`bar0` 读取帧元数据，`c2h` 读取 45 MiB RAW16 数据，`parse` 转成显示用内存图像，`emit_total` 从中断到进入显示队列，`queue` 保存线程排队时间，`save` 写 `.tiraw` 文件，`total` 从中断到文件保存完成；`PCIe 图像显示完成` 日志中的 `set_frame`、`controls`、`refresh`、`ui_total` 分别表示 UI 线程接收帧、控件同步、图像渲染刷新和 UI 总耗时。PCIe 监听是常驻图像入口，删除图片、切换历史图像、打开本地图像和发送 `STOP_DYNC` 都不会停止上图中断处理。
+软件启动后会自动开始 PCIe 图像监听，不需要手动点击开始按钮。监听逻辑是：从 `/dev/idma0_event_0` 等待图像中断，中断到达后先按配置等待，再从 BAR0 读取实际行列、image_id 和最终图像 DDR 地址；根据 BAR0 DMA 地址表将最终 DDR 地址转换为 `/dev/idma0_c2h_0` 的读取偏移，然后按 BAR0[0x00c] 行数、BAR0[0x010] 列数读取 RAW16 图像。内存图像快速解析后立即进入显示队列，保存线程随后在后台保存为 `.tiraw` 文件，文件写完后再加入左侧图像列表。PCIe 图像默认保存到 Qt 应用数据目录下的 `pcie_images` 子目录。BAR0 会自动查找 vendor `0x1b4d`、device `0x6667` 的 `resource0`；如果 BAR0 行列暂时为 0，则使用 3072x7680 作为备用尺寸。PCIe 日志中的阶段耗时含义为：`wait` 等待图像中断，`bar0` 读取帧元数据，`c2h` 读取本帧 RAW16 数据，`parse` 转成显示用内存图像，`emit_total` 从中断到进入显示队列，`queue` 保存线程排队时间，`save` 写 `.tiraw` 文件，`total` 从中断到文件保存完成；`PCIe 图像显示完成` 日志中的 `set_frame`、`controls`、`refresh`、`ui_total` 分别表示 UI 线程接收帧、控件同步、图像渲染刷新和 UI 总耗时。PCIe 监听是常驻图像入口，删除图片、切换历史图像、打开本地图像和发送 `STOP_DYNC` 都不会停止上图中断处理。
 
-本地回放和 PCIe 接收使用相同的 `IImageSource -> ImageAcquisitionController -> FramePresentationController -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际显示 FPS。
+PCIe 接收使用 `IImageSource -> ImageAcquisitionController -> FramePresentationController -> ImageSession -> ImageView` 更新路径。连续同尺寸帧不会重置缩放、平移、旋转或翻转状态；状态栏显示实际显示 FPS。
 
 普通图像列表保存文件路径、缩略图和最近使用的少量图像缓存。点击列表项时优先复用最近 12 张
 16-bit 原始帧；未命中时再快速读取预览数据。选中一项或多项后，可点击“移除选中图像”、按
 Delete，或使用右键菜单移除。移除只影响列表，不会删除磁盘上的源文件。PCIe 监听运行时，点击
 历史图像只切换当前显示，不会停止 `/dev/idma0_event_0` 的中断监听。
 
-本地回放针对当前固定的 2～3 帧使用预加载：开始回放时读取并解析一次原始图像，循环时复用内存帧；日志会记录成功预加载帧数和耗时。稳定的本地帧携带 `contentCacheKey`，主窗口最多缓存 12 张当前窗宽窗位下的 8-bit 显示图，`ImageView` 还会在 512 MiB 上限内缓存对应 `QPixmap`，避免无显卡或远程桌面环境反复做显示格式转换。实时 PCIe 动态帧默认不提供该键，因此不会按来源名误用旧缓存。首帧立即提交，后续显示节拍跟随用户设置的 1～120 fps；累计时间基准会自动补偿整数毫秒定时误差。处理速度跟不上输入时只保留最新帧并统计显示丢帧，不累积延迟。状态栏只显示实际显示 FPS。全图 ROI 统计延迟到首帧提交后执行，并按稳定内容键缓存。调整窗宽窗位、停止或重新开始回放会自动清空相关缓存。
+稳定的本地帧携带 `contentCacheKey`，主窗口最多缓存 12 张当前窗宽窗位下的 8-bit 显示图，`ImageView` 还会在 512 MiB 上限内缓存对应 `QPixmap`，避免无显卡或远程桌面环境反复做显示格式转换。实时 PCIe 动态帧默认不提供该键，因此不会按来源名误用旧缓存。首帧立即提交，处理速度跟不上输入时只保留最新帧并统计显示丢帧，不累积延迟。状态栏只显示实际显示 FPS。全图 ROI 统计延迟到首帧提交后执行，并按稳定内容键缓存。调整窗宽窗位会自动清空相关缓存。
 
-图像列表缩略图直接从 16-bit 原始像素降采样到目标尺寸，不再先生成一张完整的 8-bit 大图，因此打开多张大图或首次回放时的界面阻塞更小。
+图像列表缩略图直接从 16-bit 原始像素降采样到目标尺寸，不再先生成一张完整的 8-bit 大图，因此打开多张大图时的界面阻塞更小。
 
 右键点击图像列表项可从“导出当前图像”子菜单选择格式：
 
@@ -400,7 +466,6 @@ ROI 统计
 Ctrl+ROI 分析测试弹窗
 Shift+ROI 按区域重算窗位窗宽
 图像算法接口与默认实现解耦
-本地 TiRaw 序列连续回放
 多图打开、缩略图列表、点击切换和批量移除
 图像列表右键导出 TiRaw、RAW16、PNG、TIFF、BMP 和 JPEG
 连续帧实际 FPS、错误和完成统计

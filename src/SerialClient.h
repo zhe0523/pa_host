@@ -23,6 +23,9 @@ public:
     QString portName() const override;
 
     bool sendLine(const QString& line, QString* errorMessage) override;
+    bool sendBinaryFrame(const PaBinaryProtocol::Frame& frame, QString* errorMessage) override;
+    void setBinaryMode(bool enabled) override;
+    bool binaryMode() const;
 
 private slots:
     void handleReadyRead();
@@ -31,4 +34,6 @@ private slots:
 private:
     QSerialPort serial_;
     QByteArray rxBuffer_; // 未凑齐一整行的接收缓存
+    PaBinaryProtocol::StreamParser binaryParser_;
+    bool binaryMode_ = false;
 };

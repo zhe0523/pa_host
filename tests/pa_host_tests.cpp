@@ -10,6 +10,7 @@
 #include "ImageTransferWorkflowController.h"
 #include "MtfAnalysis.h"
 #include "PaDeviceController.h"
+#include "PaBinaryProtocol.h"
 #include "PaProtocol.h"
 #include "ReplayPresentationScheduler.h"
 #include "TiRawImage.h"
@@ -22,6 +23,7 @@
 #include <QTemporaryDir>
 
 #include <cmath>
+#include <cstdio>
 #include <functional>
 #include <iterator>
 
@@ -78,6 +80,19 @@ public:
         return true;
     }
 
+    bool sendBinaryFrame(const PaBinaryProtocol::Frame& frame, QString* errorMessage) override {
+        if (!openState || failSend) {
+            if (errorMessage != nullptr) *errorMessage = QStringLiteral("模拟二进制发送失败");
+            return false;
+        }
+        sentBinaryFrames.push_back(frame);
+        return true;
+    }
+
+    void setBinaryMode(bool enabled) override {
+        binaryMode = enabled;
+    }
+
     void injectLine(const QString& line) {
         emit lineReceived(line);
     }
@@ -86,12 +101,18 @@ public:
         emit errorOccurred(message);
     }
 
+    void injectBinaryFrame(const PaBinaryProtocol::Frame& frame) {
+        emit binaryFrameReceived(frame);
+    }
+
     bool openState = false;
     bool failOpen = false;
     bool failSend = false;
     QString lastPortName;
     int lastBaudRate = 0;
     QStringList sentLines;
+    QList<PaBinaryProtocol::Frame> sentBinaryFrames;
+    bool binaryMode = false;
 };
 
 class FakeImageSource final : public IImageSource {
@@ -244,6 +265,58 @@ bool testProtocolResponses() {
     CHECK(!empty.ok);
     CHECK(!empty.error);
     CHECK(empty.keyword.isEmpty());
+    return true;
+}
+
+void appendLe32(QByteArray* data, quint32 value) {
+    data->append(static_cast<char>(value & 0xff));
+    data->append(static_cast<char>((value >> 8) & 0xff));
+    data->append(static_cast<char>((value >> 16) & 0xff));
+    data->append(static_cast<char>((value >> 24) & 0xff));
+}
+
+void appendTlvU32(QByteArray* data, quint16 type, quint32 value) {
+    appendLe16(data, type);
+    appendLe16(data, 4);
+    appendLe32(data, value);
+}
+
+bool testBinaryProtocol() {
+    PaBinaryProtocol::Frame request;
+    request.messageType = PaBinaryProtocol::MessageType::Request;
+    request.command = 0x0001;
+    request.sequence = 1;
+
+    QByteArray encoded;
+    QString error;
+    CHECK(PaBinaryProtocol::encode(request, &encoded, &error));
+    CHECK(encoded.toHex(' ').toUpper()
+        == QByteArrayLiteral("AA 55 01 10 01 00 01 00 01 00 00 00 00 00 00 00 78 62"));
+
+    PaBinaryProtocol::Frame decoded;
+    CHECK(PaBinaryProtocol::decode(encoded, &decoded, &error));
+    CHECK(decoded.command == 0x0001);
+    CHECK(decoded.sequence == 1);
+    CHECK(decoded.payload.isEmpty());
+
+    PaBinaryProtocol::Frame payloadFrame = request;
+    payloadFrame.messageType = PaBinaryProtocol::MessageType::Done;
+    payloadFrame.command = 0x0200;
+    payloadFrame.sequence = 42;
+    payloadFrame.payload = QByteArray::fromHex("0102030405");
+    QByteArray payloadEncoded;
+    CHECK(PaBinaryProtocol::encode(payloadFrame, &payloadEncoded, &error));
+    payloadEncoded[0] = static_cast<char>(0x99);
+    CHECK(!PaBinaryProtocol::decode(payloadEncoded, &decoded, &error));
+
+    PaBinaryProtocol::StreamParser parser;
+    const QByteArray stream = QByteArrayLiteral("noise") + encoded + encoded;
+    CHECK(parser.feed(stream.left(5), &error).isEmpty());
+    const auto frames = parser.feed(stream.mid(5), &error);
+    CHECK(frames.size() == 2);
+    CHECK(frames.at(0).sequence == 1);
+    CHECK(frames.at(1).command == 0x0001);
+    CHECK(parser.bufferedBytes() == 0);
     return true;
 }
 
@@ -478,6 +551,97 @@ bool testPaDeviceController() {
     CHECK(error == QStringLiteral("模拟打开失败"));
     CHECK(failedController.state() == PaDeviceState::Error);
     CHECK(!errors.isEmpty());
+    return true;
+}
+
+bool testPaDeviceBinaryBusinessCommands() {
+    struct Result {
+        quint16 command = 0;
+        QMap<quint16, quint32> values;
+        bool success = false;
+    };
+    FakeLineTransport transport;
+    PaDeviceController controller(&transport);
+    QVector<Result> results;
+    QObject::connect(&controller, &PaDeviceController::binaryCommandFinished,
+        [&results](quint16 command, const QMap<quint16, quint32>& values,
+                   bool success, const QString&) {
+            results.push_back({command, values, success});
+        });
+    QString error;
+    CHECK(controller.connectDevice(QStringLiteral("COM_BINARY"), 115200, &error));
+    controller.setBinaryProtocolEnabled(true);
+    CHECK(transport.binaryMode);
+
+    CHECK(controller.beginOffsetCalibration(12, 8, 1, &error));
+    CHECK(transport.sentBinaryFrames.last().command == 0x0300);
+    CHECK(transport.sentBinaryFrames.last().payload.toHex()
+          == QByteArrayLiteral("003004000c00000001300400080000000230010001"));
+    PaBinaryProtocol::Frame done;
+    done.messageType = PaBinaryProtocol::MessageType::Done;
+    done.command = 0x0300;
+    done.sequence = transport.sentBinaryFrames.last().sequence;
+    appendTlvU32(&done.payload, 0x3000, 12);
+    transport.injectBinaryFrame(done);
+    CHECK(!controller.hasPendingCommand());
+    CHECK(results.size() == 1);
+    CHECK(results.last().success);
+    CHECK(results.last().values.value(0x3000) == 12);
+
+    CHECK(controller.beginGainCalibration({5000, 10000, 20000}, 4, 0.3f, &error));
+    CHECK(transport.sentBinaryFrames.last().command == 0x0304);
+    CHECK(transport.sentBinaryFrames.last().payload.contains(QByteArray::fromHex("10310c008813000010270000204e0000")));
+    done = {};
+    done.messageType = PaBinaryProtocol::MessageType::Done;
+    done.command = 0x0304;
+    done.sequence = transport.sentBinaryFrames.last().sequence;
+    transport.injectBinaryFrame(done);
+    CHECK(!controller.hasPendingCommand());
+
+    CHECK(controller.configureTemplateUpload(true, 7680, 3072, &error));
+    CHECK(transport.sentBinaryFrames.last().command == 0x0500);
+    CHECK(transport.sentBinaryFrames.last().payload.toHex()
+          == QByteArrayLiteral("005004000100000002500400001e000003500400000c00000450040000b40000"));
+    done = {};
+    done.messageType = PaBinaryProtocol::MessageType::Done;
+    done.command = 0x0500;
+    done.sequence = transport.sentBinaryFrames.last().sequence;
+    appendTlvU32(&done.payload, 0x5001, 0x12340000);
+    transport.injectBinaryFrame(done);
+    CHECK(results.last().command == 0x0500);
+    CHECK(results.last().values.value(0x5001) == 0x12340000);
+
+    QMap<quint16, quint32> dynamicValues;
+    for (quint16 i = 0; i < 18; ++i) dynamicValues.insert(static_cast<quint16>(0x2100 + i), i + 1);
+    const int resultsBeforeChunks = results.size();
+    const int framesBeforeChunks = transport.sentBinaryFrames.size();
+    CHECK(controller.setConfigGroup(5, dynamicValues, &error));
+    CHECK(transport.sentBinaryFrames.size() == framesBeforeChunks + 1);
+    for (int chunk = 0; chunk < 3; ++chunk) {
+        done = {};
+        done.messageType = PaBinaryProtocol::MessageType::Done;
+        done.command = 0x0104;
+        done.sequence = transport.sentBinaryFrames.last().sequence;
+        appendTlvU32(&done.payload, 0x0600, 3);
+        transport.injectBinaryFrame(done);
+        if (chunk < 2) CHECK(controller.hasPendingCommand());
+    }
+    CHECK(!controller.hasPendingCommand());
+    CHECK(transport.sentBinaryFrames.size() == framesBeforeChunks + 3);
+    CHECK(results.size() == resultsBeforeChunks + 1);
+
+    CHECK(controller.queryDynamic(&error));
+    CHECK(transport.sentBinaryFrames.last().command == 0x0212);
+    done = {};
+    done.messageType = PaBinaryProtocol::MessageType::Done;
+    done.command = 0x0212;
+    done.sequence = transport.sentBinaryFrames.last().sequence;
+    appendTlvU32(&done.payload, 0x2003, 1);
+    appendTlvU32(&done.payload, 0x2004, 0x26a00000);
+    appendTlvU32(&done.payload, 0x2008, 0);
+    transport.injectBinaryFrame(done);
+    CHECK(results.last().values.value(0x2003) == 1);
+    CHECK(results.last().values.value(0x2004) == 0x26a00000);
     return true;
 }
 
@@ -986,91 +1150,6 @@ bool testImageAcquisitionController() {
     return true;
 }
 
-bool testLocalReplaySource() {
-    QTemporaryDir directory;
-    CHECK(directory.isValid());
-    const QString first = directory.filePath(QStringLiteral("first.tiraw"));
-    const QString second = directory.filePath(QStringLiteral("second.tiraw"));
-    CHECK(writeTiraw(first, 2, 1, {1, 2}));
-    CHECK(writeTiraw(second, 2, 1, {3, 4}));
-
-    LocalReplaySource source;
-    source.setPlaylist({first, second});
-    source.setIntervalMs(1);
-    source.setLoopEnabled(false);
-    QVector<ImageFrame> frames;
-    bool runningWhileDelivering = true;
-    QEventLoop loop;
-    QTimer timeout;
-    timeout.setSingleShot(true);
-    QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
-    QObject::connect(&source, &LocalReplaySource::frameReady, &loop, [&frames, &source, &runningWhileDelivering](const ImageFrame& frame) {
-        runningWhileDelivering = runningWhileDelivering && source.isRunning();
-        frames.push_back(frame);
-    });
-    QObject::connect(&source, &LocalReplaySource::runningChanged, &loop, [&loop](bool running) {
-        if (!running) {
-            loop.quit();
-        }
-    });
-
-    QString error;
-    CHECK(source.start(&error));
-    CHECK(QFile::remove(second));
-    timeout.start(1000);
-    loop.exec();
-    CHECK(frames.size() == 2);
-    CHECK(frames.at(0).sequence == 0);
-    CHECK(frames.at(1).sequence == 1);
-    CHECK(frames.at(0).contentCacheKey == QFileInfo(first).absoluteFilePath());
-    CHECK(frames.at(0).image.minValue() == 1);
-    CHECK(runningWhileDelivering);
-    CHECK(!source.isRunning());
-    CHECK(source.stats().deliveredFrames == 2);
-    CHECK(source.stats().failedFrames == 0);
-
-    LocalReplaySource invalidSource;
-    invalidSource.setPlaylist({directory.filePath(QStringLiteral("missing.tiraw")), first});
-    invalidSource.setIntervalMs(1);
-    invalidSource.setLoopEnabled(false);
-    int validFrames = 0;
-    QEventLoop invalidLoop;
-    QTimer invalidTimeout;
-    invalidTimeout.setSingleShot(true);
-    QObject::connect(&invalidTimeout, &QTimer::timeout, &invalidLoop, &QEventLoop::quit);
-    QObject::connect(&invalidSource, &LocalReplaySource::frameReady, &invalidLoop, [&validFrames](const ImageFrame&) {
-        ++validFrames;
-    });
-    QObject::connect(&invalidSource, &LocalReplaySource::runningChanged, &invalidLoop, [&invalidLoop](bool running) {
-        if (!running) {
-            invalidLoop.quit();
-        }
-    });
-    CHECK(invalidSource.start(&error));
-    invalidTimeout.start(1000);
-    invalidLoop.exec();
-    CHECK(validFrames == 1);
-    CHECK(invalidSource.stats().failedFrames == 1);
-
-    LocalReplaySource restartedSource;
-    restartedSource.setPlaylist({first});
-    restartedSource.setIntervalMs(1000);
-    restartedSource.setLoopEnabled(true);
-    int restartedFrames = 0;
-    QObject::connect(&restartedSource, &LocalReplaySource::frameReady, [&restartedFrames](const ImageFrame&) {
-        ++restartedFrames;
-    });
-    CHECK(restartedSource.start(&error));
-    restartedSource.stop();
-    CHECK(restartedSource.start(&error));
-    QEventLoop restartLoop;
-    QTimer::singleShot(20, &restartLoop, &QEventLoop::quit);
-    restartLoop.exec();
-    restartedSource.stop();
-    CHECK(restartedFrames == 1);
-    return true;
-}
-
 bool testInvalidTirawFiles() {
     QTemporaryDir directory;
     CHECK(directory.isValid());
@@ -1143,9 +1222,11 @@ int main(int argc, char* argv[]) {
     const TestCase tests[] = {
         {"protocol_commands", testProtocolCommands},
         {"protocol_responses", testProtocolResponses},
+        {"binary_protocol", testBinaryProtocol},
         {"app_settings", testAppSettings},
         {"app_log_service", testAppLogService},
         {"pa_device_controller", testPaDeviceController},
+        {"pa_device_binary_business_commands", testPaDeviceBinaryBusinessCommands},
         {"image_transfer_workflow_controller", testImageTransferWorkflowController},
         {"tiraw_parsing_and_roi", testTirawParsingAndRoi},
         {"auto_window_level", testAutoWindowLevel},
@@ -1155,7 +1236,6 @@ int main(int argc, char* argv[]) {
         {"replay_presentation_scheduler", testReplayPresentationScheduler},
         {"frame_presentation_controller", testFramePresentationController},
         {"image_acquisition_controller", testImageAcquisitionController},
-        {"local_replay_source", testLocalReplaySource},
         {"invalid_tiraw_files", testInvalidTirawFiles},
         {"mtf_analysis_and_export", testMtfAnalysisAndExport},
     };
@@ -1164,12 +1244,16 @@ int main(int argc, char* argv[]) {
     for (const TestCase& test : tests) {
         if (test.run()) {
             qInfo("PASS %s", test.name);
+            std::fprintf(stderr, "PASS %s\n", test.name);
         } else {
             qCritical("FAIL %s", test.name);
+            std::fprintf(stderr, "FAIL %s\n", test.name);
             ++failures;
         }
     }
 
     qInfo("测试完成: %d 通过, %d 失败", static_cast<int>(std::size(tests)) - failures, failures);
+    std::fprintf(stderr, "测试完成: %d 通过, %d 失败\n",
+        static_cast<int>(std::size(tests)) - failures, failures);
     return failures == 0 ? 0 : 1;
 }

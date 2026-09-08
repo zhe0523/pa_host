@@ -40,37 +40,4 @@ signals:
     void runningChanged(bool running);
 };
 
-/*
- * Local replay is the hardware-free implementation of the image source
- * contract. It is used to exercise the same display path that a future PCIe
- * source will use.
- */
-class LocalReplaySource final : public IImageSource {
-public:
-    explicit LocalReplaySource(QObject* parent = nullptr);
-
-    void setPlaylist(const QStringList& paths);
-    void setIntervalMs(int intervalMs);
-    void setLoopEnabled(bool enabled);
-
-    bool start(QString* errorMessage) override;
-    void stop() override;
-    bool isRunning() const override;
-    ImageSourceStats stats() const override;
-
-private:
-    void deliverNext();
-
-    QStringList playlist_;
-    QVector<ImageFrame> cachedFrames_;
-    QTimer initialDeliveryTimer_;
-    QTimer timer_;
-    int intervalMs_ = 33;
-    int nextIndex_ = 0;
-    quint64 runGeneration_ = 0;
-    bool loopEnabled_ = true;
-    bool running_ = false;
-    ImageSourceStats stats_;
-};
-
 Q_DECLARE_METATYPE(ImageFrame)

@@ -20,6 +20,7 @@ struct PcieImageSourceOptions {
     QString eventDevice = QStringLiteral("/dev/idma0_event_0");
     QString bar0Resource;
     QString outputDirectory;
+    /* BAR0 未提供有效行列时使用的备用尺寸；正常情况下每帧尺寸来自 BAR0[0x00c/0x010]。 */
     int width = 3072;
     int height = 7680;
     int interruptTimeoutMs = 1000;
@@ -30,8 +31,8 @@ struct PcieImageSourceOptions {
  *
  * 该类把 tools/pcie_read/c2h_capture_loop.c 的 C2H 读取流程接入上位机：
  *   1. 等待 /dev/idma0_event_0 图像中断；
- *   2. 从 BAR0 读取 image_id 和最终 DDR 地址；
- *   3. 从 /dev/idma0_c2h_0 读取一帧 RAW16；
+ *   2. 从 BAR0 读取 image_id、实际行列和最终 DDR 地址；
+ *   3. 按 BAR0 行列从 /dev/idma0_c2h_0 读取一帧 RAW16；
  *   4. 先把内存图像送入统一显示链路，再由保存线程写 .tiraw 文件。
  *
  * Windows 只保留接口以便工程继续编译；实际 PCIe 采集只在 Linux/Kylin 上启用。
@@ -52,7 +53,7 @@ public:
 
 signals:
     void captureInfo(const QString& message);
-    void frameFileSaved(const QString& path);
+    void frameFileSaved(const QString& path, const TiRawImage& image);
 
 private:
     enum class InterruptWaitResult {
@@ -64,7 +65,12 @@ private:
     struct ImageMetadata {
         std::uint32_t imageId = 0;
         std::uint32_t imageType = 0;
+        /* BAR0[0x00c] = 源图行数，BAR0[0x010] = 源图列数。 */
+        std::uint32_t rowCount = 0;
+        std::uint32_t columnCount = 0;
         std::uint64_t finalImageAddress = 0;
+        /* BAR0 DMA 地址表对应的 C2H 字符设备逻辑偏移。 */
+        std::uint64_t c2hOffset = 0;
     };
 
     struct SaveJob {
@@ -81,7 +87,7 @@ private:
     void closeDevices();
     InterruptWaitResult waitInterrupt(std::uint32_t* eventValue, QString* errorMessage);
     bool readImageMetadata(ImageMetadata* metadata, QString* errorMessage);
-    bool readImagePayload(QByteArray* payload, QString* errorMessage);
+    bool readImagePayload(const ImageMetadata& metadata, QByteArray* payload, QString* errorMessage);
     bool saveFrameFile(const TiRawImage& image, const ImageMetadata& metadata, QString* path, QString* errorMessage);
     void finishWorker();
     static bool findBar0Resource(QString* resource, QString* errorMessage);

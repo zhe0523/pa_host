@@ -33,9 +33,11 @@ private:
     QListWidgetItem* findItem(const QString& path) const;
     void updateRemovalControls();
     void removeSelectedImages();
+    void removeAllImages();
     void showContextMenu(const QPoint& position);
 
     QListWidget* imageList_ = nullptr;
     QPushButton* removeButton_ = nullptr;
+    QPushButton* removeAllButton_ = nullptr;
     QAction* removeAction_ = nullptr;
 };

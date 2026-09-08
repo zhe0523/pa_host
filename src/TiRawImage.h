@@ -7,6 +7,7 @@
 #include <QString>
 #include <QVector>
 #include <QtGlobal>
+#include <QMetaType>
 
 /*
  * TiRayRaw 图像文件读取。
@@ -90,3 +91,5 @@ private:
     int autoWindowWidth_ = 65535;
     QVector<quint16> pixels_;
 };
+
+Q_DECLARE_METATYPE(TiRawImage)

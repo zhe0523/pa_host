@@ -85,6 +85,11 @@ ImageListPanel::ImageListPanel(QWidget* parent)
     removeButton_->setToolTip(QStringLiteral("从列表移除选中图像，不删除源文件"));
     connect(removeButton_, &QPushButton::clicked, this, &ImageListPanel::removeSelectedImages);
 
+    removeAllButton_ = new QPushButton(QStringLiteral("移除全部图像"), this);
+    removeAllButton_->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
+    removeAllButton_->setToolTip(QStringLiteral("从列表移除全部图像，不删除源文件"));
+    connect(removeAllButton_, &QPushButton::clicked, this, &ImageListPanel::removeAllImages);
+
     removeAction_ = new QAction(QStringLiteral("移除选中图像"), imageList_);
     removeAction_->setShortcut(QKeySequence::Delete);
     removeAction_->setShortcutContext(Qt::WidgetWithChildrenShortcut);
@@ -96,6 +101,7 @@ ImageListPanel::ImageListPanel(QWidget* parent)
 
     layout->addWidget(imageList_);
     layout->addWidget(removeButton_);
+    layout->addWidget(removeAllButton_);
     updateRemovalControls();
 }
 
@@ -176,6 +182,9 @@ void ImageListPanel::updateRemovalControls() {
     if (removeAction_ != nullptr) {
         removeAction_->setEnabled(canRemove);
     }
+    if (removeAllButton_ != nullptr) {
+        removeAllButton_->setEnabled(imageList_ != nullptr && imageList_->count() > 0);
+    }
 }
 
 void ImageListPanel::removeSelectedImages() {
@@ -200,6 +209,20 @@ void ImageListPanel::removeSelectedImages() {
     }
     updateRemovalControls();
     emit imagesRemoved(selected.size(), currentPath());
+}
+
+void ImageListPanel::removeAllImages() {
+    const int count = imageList_->count();
+    if (count == 0) {
+        return;
+    }
+
+    {
+        const QSignalBlocker blocker(imageList_);
+        imageList_->clear();
+    }
+    updateRemovalControls();
+    emit imagesRemoved(count, QString());
 }
 
 void ImageListPanel::showContextMenu(const QPoint& position) {

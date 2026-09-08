@@ -47,6 +47,8 @@ add_library(pa_core STATIC
     src/MtfAnalysis.h
     src/PaProtocol.cpp
     src/PaProtocol.h
+    src/PaBinaryProtocol.cpp
+    src/PaBinaryProtocol.h
     src/PcieImageSource.cpp
     src/PcieImageSource.h
     src/PaDeviceController.cpp

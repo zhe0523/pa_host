@@ -7,6 +7,7 @@
 #include <QHash>
 #include <QList>
 #include <QMainWindow>
+#include <QMap>
 #include <QPlainTextEdit>
 #include <QPoint>
 #include <QRect>
@@ -54,12 +55,12 @@ public:
     explicit MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* parent = nullptr);
     ~MainWindow() override;
 
+    /* 启动时选择正式二进制协议；默认仍是研发 ASCII 兼容模式。 */
+    void setBinaryProtocolEnabled(bool enabled);
+
 private slots:
     void openImage();
-    void startImageReplay();
     void startPcieCapture();
-    void stopImageReplay();
-    void stopDynamicMode();
     void saveDisplayImage();
     void connectSerial();
     void disconnectSerial();
@@ -69,6 +70,14 @@ private slots:
     void exportDiagnostics();
     void configureCommandTimeout();
     void showAbout();
+    void showOffsetTemplateDialog();
+    void showGainTemplateDialog();
+    void viewOffsetTemplate();
+    void viewGainTemplate();
+    void showDynamicConfigDialog();
+    void queryDynamicStatus();
+    void showDeveloperDialog();
+    void showDebugDialog();
 
 private:
     QWidget* createTopBar();
@@ -85,6 +94,7 @@ private:
     void showCurrentSessionImage(const QString& source, bool resetViewState);
     void clearCurrentImage();
     void clearFrameDisplayCaches();
+    void stopImageAcquisition();
     void scheduleImageRefresh(bool resetViewState = false);
     void refreshImage(bool resetViewState = false);
     void updatePixelInfo(const QPoint& imagePoint);
@@ -99,12 +109,16 @@ private:
     void updateWindowLevelControlState();
     void updateImageTransferControls();
     void updateDeviceState(PaDeviceState state);
+    void handleBinaryCommandFinished(quint16 command,
+                                     const QMap<quint16, quint32>& values,
+                                     bool success,
+                                     const QString& detail);
+    void startTemplateUpload(bool gainTemplate);
 
     SerialClient serial_;
     std::unique_ptr<AppSettings> settings_;
     std::unique_ptr<ImageSession> imageSession_;
     AppLogService* logService_ = nullptr;
-    LocalReplaySource* replaySource_ = nullptr;
     PcieImageSource* pcieSource_ = nullptr;
     ImageAcquisitionController* acquisitionController_ = nullptr;
     PaDeviceController* deviceController_ = nullptr;
@@ -120,12 +134,10 @@ private:
     QPlainTextEdit* logView_ = nullptr;
     QMenu* viewMenu_ = nullptr;
     QAction* imageMaximizeAction_ = nullptr;
-    QAction* stopReplayAction_ = nullptr;
     QAction* saveDisplayAction_ = nullptr;
     QAction* refreshPortsAction_ = nullptr;
     QAction* connectSerialAction_ = nullptr;
     QAction* disconnectSerialAction_ = nullptr;
-    QList<QAction*> deviceCommandActions_;
 
     QComboBox* portCombo_ = nullptr;
     QSpinBox* baudSpin_ = nullptr;
@@ -166,6 +178,8 @@ private:
     QSize lastDisplayRenderSize_;
     QString armProgramVersion_;
     QString fpgaVersion_;
+    QString pendingTemplateUploadName_;
+    bool awaitingTemplateFrame_ = false;
     bool resetViewStateOnRefresh_ = false;
     bool imageMaximized_ = false;
 };

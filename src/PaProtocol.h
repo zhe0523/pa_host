@@ -8,12 +8,13 @@
 /*
  * PA/ARM 串口协议定义。
  *
- * 当前 ARM 端 pa_controller 使用 ASCII 行协议：
+ * 当前 ARM 端 pa_controller 同时保留两类入口：
  *   - 上位机发送一行命令，结尾为 \r\n 或 \n。
  *   - ARM 返回一行响应，成功以 OK 开头，失败以 ERR 开头。
+ *   - 正式二进制协议由 PaBinaryProtocol 负责，不能在这里拼接文本命令。
  *
  * 这个类只负责“命令字符串”和“响应文本解析”，不负责串口读写。
- * 后续如果协议改成二进制帧，只需要重点替换本类和 SerialClient 的收发边界。
+ * ASCII 命令仅用于研发调试和兼容；正式上位机应使用 PaBinaryProtocol。
  */
 class PaProtocol {
 public:

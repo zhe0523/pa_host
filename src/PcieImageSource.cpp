@@ -28,6 +28,11 @@ constexpr int kBar0MapSize = 4096;
 constexpr int kIoChunkSize = 1 << 20;
 constexpr int kStopPollSliceMs = 200;
 constexpr int kPciVendorDeviceTextSize = 32;
+/* 收到 PCIe 中断后、读取 C2H 内存前的等待时间，单位 us。 */
+constexpr unsigned int kC2hReadDelayUs = 0;
+constexpr std::uint32_t kBar0DmaAddressTableBase = 0x100;
+constexpr std::uint32_t kBar0DmaAddressTableStride = 0x8;
+constexpr int kBar0DmaAddressTableEntries = 69;
 
 QString errnoMessage(const QString& what) {
     return QStringLiteral("%1: %2 (errno=%3)")
@@ -52,6 +57,7 @@ QString defaultPcieOutputDirectory() {
 PcieImageSource::PcieImageSource(QObject* parent)
     : IImageSource(parent) {
     qRegisterMetaType<ImageFrame>("ImageFrame");
+    qRegisterMetaType<TiRawImage>("TiRawImage");
 }
 
 PcieImageSource::~PcieImageSource() {
@@ -168,6 +174,11 @@ void PcieImageSource::run() {
             .arg(eventValue, 0, 16)
             .arg(waitMs));
 
+        /* 中断到达与整帧 DDR 写入完成之间可能存在硬件时序间隔。 */
+        if (kC2hReadDelayUs > 0) {
+            ::usleep(kC2hReadDelayUs);
+        }
+
         ImageMetadata metadata;
         stageTimer.restart();
         if (!readImageMetadata(&metadata, &error)) {
@@ -178,7 +189,9 @@ void PcieImageSource::run() {
         const qint64 bar0Ms = stageTimer.elapsed();
         if (haveLastMetadata
             && metadata.imageId == lastMetadata.imageId
-            && metadata.finalImageAddress == lastMetadata.finalImageAddress) {
+            && metadata.finalImageAddress == lastMetadata.finalImageAddress
+            && metadata.rowCount == lastMetadata.rowCount
+            && metadata.columnCount == lastMetadata.columnCount) {
             continue;
         }
         haveLastMetadata = true;
@@ -186,7 +199,7 @@ void PcieImageSource::run() {
 
         QByteArray payload;
         stageTimer.restart();
-        if (!readImagePayload(&payload, &error)) {
+        if (!readImagePayload(metadata, &payload, &error)) {
             ++failedFrames_;
             emit sourceError(QStringLiteral("PCIe C2H 图像读取失败: %1").arg(error));
             continue;
@@ -198,7 +211,17 @@ void PcieImageSource::run() {
             .arg(metadata.imageId)
             .arg(metadata.finalImageAddress, 0, 16);
         stageTimer.restart();
-        if (!image.loadRaw16Data(payload, options_.width, options_.height, sourceName, &error)) {
+        if (metadata.columnCount > static_cast<std::uint32_t>(std::numeric_limits<int>::max())
+            || metadata.rowCount > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+            ++failedFrames_;
+            emit sourceError(QStringLiteral("PCIe BAR0 图像尺寸超过 Qt int 范围: row=%1 col=%2")
+                .arg(metadata.rowCount)
+                .arg(metadata.columnCount));
+            continue;
+        }
+        const int frameWidth = metadata.columnCount > 0 ? static_cast<int>(metadata.columnCount) : options_.width;
+        const int frameHeight = metadata.rowCount > 0 ? static_cast<int>(metadata.rowCount) : options_.height;
+        if (!image.loadRaw16Data(payload, frameWidth, frameHeight, sourceName, &error)) {
             ++failedFrames_;
             emit sourceError(QStringLiteral("PCIe RAW16 图像解析失败: %1").arg(error));
             continue;
@@ -219,10 +242,14 @@ void PcieImageSource::run() {
         const qint64 emitMs = totalTimer.elapsed();
 
         emit captureInfo(QStringLiteral(
-            "PCIe 图像已进入显示队列: id=%1 event=0x%2 final_addr=0x%3 wait=%4ms bar0=%5ms c2h=%6ms parse=%7ms emit_total=%8ms")
+            "PCIe 图像已进入显示队列: id=%1 event=0x%2 final_addr=0x%3 c2h_offset=0x%4 size=%5x%6 bytes=%7 wait=%8ms bar0=%9ms c2h=%10ms parse=%11ms emit_total=%12ms")
                 .arg(metadata.imageId)
                 .arg(eventValue, 0, 16)
                 .arg(metadata.finalImageAddress, 0, 16)
+                .arg(metadata.c2hOffset, 0, 16)
+                .arg(frameWidth)
+                .arg(frameHeight)
+                .arg(payload.size())
                 .arg(waitMs)
                 .arg(bar0Ms)
                 .arg(c2hMs)
@@ -266,7 +293,8 @@ void PcieImageSource::runSaver() {
             continue;
         }
         const qint64 saveMs = stageTimer.elapsed();
-        emit frameFileSaved(framePath);
+        // 保存线程复用已解析的内存图像，避免主线程为缩略图和信息统计再次读盘。
+        emit frameFileSaved(framePath, job.image);
         const qint64 totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - job.interruptAt).count();
         const qint64 queueMs = std::max<qint64>(0, totalMs - job.displayQueuedMs - saveMs);
@@ -397,27 +425,66 @@ bool PcieImageSource::readImageMetadata(ImageMetadata* metadata, QString* errorM
     }
 
     const auto* base = static_cast<const unsigned char*>(map);
+    metadata->rowCount = readLe32(base + 0x0c);
+    metadata->columnCount = readLe32(base + 0x10);
     metadata->imageId = readLe32(base + 0x14);
     metadata->imageType = readLe32(base + 0x18);
     const std::uint32_t finalAddrLo = readLe32(base + 0x1c);
     const std::uint32_t finalAddrHi = readLe32(base + 0x20);
     metadata->finalImageAddress = (static_cast<std::uint64_t>(finalAddrHi) << 32)
         | static_cast<std::uint64_t>(finalAddrLo);
+    const std::uint32_t blockSize = readLe32(base + 0x08);
+    if (blockSize == 0) {
+        ::munmap(map, kBar0MapSize);
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("BAR0 C2H 块大小为 0");
+        }
+        return false;
+    }
+    bool addressMatched = false;
+    for (int index = 0; index < kBar0DmaAddressTableEntries; ++index) {
+        const std::uint32_t addressOffset = kBar0DmaAddressTableBase
+            + static_cast<std::uint32_t>(index) * kBar0DmaAddressTableStride;
+        const std::uint32_t dmaLo = readLe32(base + addressOffset);
+        const std::uint32_t dmaHi = readLe32(base + addressOffset + 4);
+        const std::uint64_t dmaAddress = (static_cast<std::uint64_t>(dmaHi) << 32)
+            | static_cast<std::uint64_t>(dmaLo);
+        if (metadata->finalImageAddress >= dmaAddress
+            && metadata->finalImageAddress - dmaAddress < blockSize) {
+            metadata->c2hOffset = static_cast<std::uint64_t>(index) * blockSize
+                + (metadata->finalImageAddress - dmaAddress);
+            addressMatched = true;
+            break;
+        }
+    }
+    if (!addressMatched) {
+        ::munmap(map, kBar0MapSize);
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("BAR0 最终图像地址未在 C2H DMA 地址表中找到: 0x%1")
+                .arg(metadata->finalImageAddress, 0, 16);
+        }
+        return false;
+    }
     ::munmap(map, kBar0MapSize);
     return true;
 #endif
 }
 
-bool PcieImageSource::readImagePayload(QByteArray* payload, QString* errorMessage) {
+bool PcieImageSource::readImagePayload(const ImageMetadata& metadata,
+                                       QByteArray* payload,
+                                       QString* errorMessage) {
 #ifdef Q_OS_WIN
+    Q_UNUSED(metadata);
     Q_UNUSED(payload);
     Q_UNUSED(errorMessage);
     return false;
 #else
-    const qint64 imageBytes = static_cast<qint64>(options_.width) * options_.height * 2;
-    if (imageBytes <= 0) {
+    const std::uint32_t rows = metadata.rowCount > 0 ? metadata.rowCount : static_cast<std::uint32_t>(options_.height);
+    const std::uint32_t columns = metadata.columnCount > 0 ? metadata.columnCount : static_cast<std::uint32_t>(options_.width);
+    const qint64 imageBytes = static_cast<qint64>(rows) * static_cast<qint64>(columns) * 2;
+    if (rows == 0 || columns == 0 || imageBytes <= 0) {
         if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("PCIe 图像字节数无效");
+            *errorMessage = QStringLiteral("PCIe 图像尺寸无效: row=%1 col=%2").arg(rows).arg(columns);
         }
         return false;
     }
@@ -428,7 +495,7 @@ bool PcieImageSource::readImagePayload(QByteArray* payload, QString* errorMessag
         return false;
     }
     payload->resize(static_cast<int>(imageBytes));
-    if (::lseek(c2hFd_, 0, SEEK_SET) < 0) {
+    if (::lseek(c2hFd_, static_cast<off_t>(metadata.c2hOffset), SEEK_SET) < 0) {
         if (errorMessage != nullptr) {
             *errorMessage = errnoMessage(options_.c2hDevice);
         }
@@ -477,9 +544,11 @@ bool PcieImageSource::saveFrameFile(
     }
 
     const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
-    const QString fileName = QStringLiteral("pcie_%1_id%2_addr0x%3.tiraw")
+    const QString fileName = QStringLiteral("pcie_%1_id%2_%3x%4_addr0x%5.tiraw")
         .arg(timestamp)
         .arg(metadata.imageId)
+        .arg(image.width())
+        .arg(image.height())
         .arg(metadata.finalImageAddress, 0, 16);
     const QString filePath = directory.filePath(fileName);
     if (!image.saveTiRaw(filePath, errorMessage)) {
