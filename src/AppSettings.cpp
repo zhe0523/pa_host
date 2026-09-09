@@ -12,14 +12,10 @@ const char kLastExportDirectoryKey[] = "paths/lastExportDirectory";
 const char kLastDiagnosticDirectoryKey[] = "paths/lastDiagnosticDirectory";
 const char kSerialPortKey[] = "control/serialPort";
 const char kSerialBaudRateKey[] = "control/serialBaudRate";
-const char kCommandTimeoutMsKey[] = "control/commandTimeoutMs";
 
 constexpr int kDefaultBaudRate = 115200;
 constexpr int kMinimumBaudRate = 1200;
 constexpr int kMaximumBaudRate = 3000000;
-constexpr int kDefaultCommandTimeoutMs = 5000;
-constexpr int kMinimumCommandTimeoutMs = 100;
-constexpr int kMaximumCommandTimeoutMs = 300000;
 
 QString defaultSerialPort() {
 #ifdef Q_OS_WIN
@@ -93,19 +89,6 @@ int AppSettings::serialBaudRate() const {
 void AppSettings::setSerialBaudRate(int baudRate) {
     settings_->setValue(QLatin1String(kSerialBaudRateKey),
         std::max(kMinimumBaudRate, std::min(kMaximumBaudRate, baudRate)));
-}
-
-int AppSettings::commandTimeoutMs() const {
-    return std::max(kMinimumCommandTimeoutMs,
-        std::min(kMaximumCommandTimeoutMs,
-            settings_->value(
-                QLatin1String(kCommandTimeoutMsKey), kDefaultCommandTimeoutMs).toInt()));
-}
-
-void AppSettings::setCommandTimeoutMs(int timeoutMs) {
-    settings_->setValue(QLatin1String(kCommandTimeoutMsKey),
-        std::max(kMinimumCommandTimeoutMs,
-            std::min(kMaximumCommandTimeoutMs, timeoutMs)));
 }
 
 void AppSettings::sync() {

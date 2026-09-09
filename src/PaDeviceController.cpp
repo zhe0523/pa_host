@@ -2,7 +2,6 @@
 
 #include "ILineTransport.h"
 
-#include <initializer_list>
 #include <cstring>
 #include <limits>
 
@@ -12,57 +11,6 @@ QString formatVersionWord(quint32 value) {
         .arg((value >> 16) & 0xffu)
         .arg((value >> 8) & 0xffu)
         .arg(value & 0xffu);
-}
-
-bool readUnsignedField(
-    const QMap<QString, QString>& fields,
-    const QString& key,
-    quint32* value) {
-    const auto it = fields.constFind(key);
-    if (it == fields.cend()) {
-        return false;
-    }
-    bool ok = false;
-    const qulonglong parsed = it.value().toULongLong(&ok, 0);
-    if (!ok || parsed > std::numeric_limits<quint32>::max()) {
-        return false;
-    }
-    *value = static_cast<quint32>(parsed);
-    return true;
-}
-
-bool readIntField(
-    const QMap<QString, QString>& fields,
-    const QString& key,
-    int* value) {
-    const auto it = fields.constFind(key);
-    if (it == fields.cend()) {
-        return false;
-    }
-    bool ok = false;
-    const int parsed = it.value().toInt(&ok, 0);
-    if (!ok) {
-        return false;
-    }
-    *value = parsed;
-    return true;
-}
-
-bool readUnsignedFieldAny(
-    const QMap<QString, QString>& fields,
-    std::initializer_list<QString> keys,
-    quint32* value,
-    bool required = true) {
-    for (const QString& key : keys) {
-        if (readUnsignedField(fields, key, value)) {
-            return true;
-        }
-    }
-    if (!required && value != nullptr) {
-        *value = 0;
-        return true;
-    }
-    return false;
 }
 
 void appendLe16(QByteArray* payload, quint16 value) {
@@ -100,6 +48,16 @@ void appendTlvBytes(QByteArray* payload, quint16 type, const QByteArray& value) 
     appendLe16(payload, static_cast<quint16>(value.size()));
     payload->append(value);
 }
+
+int commandTimeoutFor(quint16 command, int configuredTimeoutMs) {
+    if (command == 0x0501 || command == 0x0301 || command == 0x0305) {
+        return qMax(configuredTimeoutMs, 15000);
+    }
+    if (command == 0x0302 || command == 0x0306) {
+        return qMax(configuredTimeoutMs, 60000);
+    }
+    return configuredTimeoutMs;
+}
 }
 
 PaDeviceController::PaDeviceController(ILineTransport* transport, QObject* parent)
@@ -116,8 +74,6 @@ PaDeviceController::PaDeviceController(ILineTransport* transport, QObject* paren
             this, &PaDeviceController::handleTransportConnectionChanged);
         connect(transport_, &ILineTransport::errorOccurred,
             this, &PaDeviceController::handleTransportError);
-        connect(transport_, &ILineTransport::lineReceived,
-            this, &PaDeviceController::handleLineReceived);
         connect(transport_, &ILineTransport::binaryFrameReceived,
             this, &PaDeviceController::handleBinaryFrame);
         state_ = transport_->isOpen() ? PaDeviceState::Ready : PaDeviceState::Disconnected;
@@ -177,18 +133,12 @@ bool PaDeviceController::sendCommand(
         setState(PaDeviceState::Disconnected);
         return rejectOperation(QStringLiteral("串口未连接"), errorMessage);
     }
-    if (!binaryProtocolEnabled_
-        && (command == PaProtocol::Command::StopTransfer
-            || command == PaProtocol::Command::StopDynamic)) {
-        return sendImmediateCommand(command, errorMessage);
-    }
     if (hasPendingCommand()) {
         return rejectOperation(QStringLiteral("上一条命令尚未完成"), errorMessage);
     }
 
-    if (binaryProtocolEnabled_) {
-        quint16 binaryCommand = 0;
-        switch (command) {
+    quint16 binaryCommand = 0;
+    switch (command) {
         case PaProtocol::Command::Ping:
             binaryCommand = 0x0002;
             break;
@@ -207,22 +157,26 @@ bool PaDeviceController::sendCommand(
             break;
         default:
             return rejectOperation(QStringLiteral("该业务命令尚未接入二进制协议"), errorMessage);
-        }
-        PaBinaryProtocol::Frame frame;
-        frame.messageType = PaBinaryProtocol::MessageType::Request;
-        frame.command = binaryCommand;
-        frame.sequence = nextSequence_++;
-        if (nextSequence_ == 0) {
-            nextSequence_ = 1;
-        }
-        pendingCommand_ = command;
-        pendingSequence_ = frame.sequence;
-        setState(PaDeviceState::Busy);
+    }
+    PaBinaryProtocol::Frame frame;
+    frame.messageType = PaBinaryProtocol::MessageType::Request;
+    frame.command = binaryCommand;
+    frame.sequence = nextSequence_++;
+    if (nextSequence_ == 0) {
+        nextSequence_ = 1;
+    }
+    pendingCommand_ = command;
+    pendingSequence_ = frame.sequence;
+    pendingBinaryFrame_ = frame;
+    binaryRetryCount_ = 0;
+    pendingTimeoutMs_ = commandTimeoutFor(binaryCommand, commandTimeoutMs_);
+    setState(PaDeviceState::Busy);
 
-        QString transportError;
-        if (!transport_->sendBinaryFrame(frame, &transportError)) {
+    QString transportError;
+    if (!transport_->sendBinaryFrame(frame, &transportError)) {
             pendingCommand_.reset();
             pendingSequence_ = 0;
+            pendingBinaryFrame_ = {};
             const QString message = transportError.isEmpty()
                 ? QStringLiteral("二进制命令发送失败")
                 : transportError;
@@ -232,37 +186,17 @@ bool PaDeviceController::sendCommand(
                 *errorMessage = message;
             }
             return false;
-        }
-        emit lineTransmitted(QStringLiteral("BIN REQ cmd=0x%1 seq=%2")
+    }
+    emit lineTransmitted(QStringLiteral("BIN REQ cmd=0x%1 seq=%2")
             .arg(frame.command, 4, 16, QLatin1Char('0'))
             .arg(frame.sequence));
-        commandTimer_.start(commandTimeoutMs_);
-        return true;
-    }
-
-    const QString line = PaProtocol::commandText(command);
-    pendingCommand_ = command;
-    setState(PaDeviceState::Busy);
-
-    QString transportError;
-    if (!transport_->sendLine(line, &transportError)) {
-        pendingCommand_.reset();
-        const QString message = transportError.isEmpty()
-            ? QStringLiteral("命令发送失败")
-            : transportError;
-        setState(PaDeviceState::Error);
-        emit errorOccurred(message);
-        if (errorMessage != nullptr) {
-            *errorMessage = message;
-        }
-        return false;
-    }
-
-    emit lineTransmitted(line);
-    if (pendingCommand_.has_value()) {
-        commandTimer_.start(commandTimeoutMs_);
-    }
+    commandTimer_.start(pendingTimeoutMs_);
     return true;
+}
+
+bool PaDeviceController::restartDevice(QString* errorMessage) {
+    /* 重启也纳入统一的超时重发；下位机会先返回确认帧，再执行重启。 */
+    return sendRawBinaryRequest(0x0005, {}, 0, errorMessage);
 }
 
 bool PaDeviceController::requestConfigGroup(quint16 groupId, QString* errorMessage) {
@@ -423,9 +357,6 @@ bool PaDeviceController::sendRawBinaryRequest(quint16 command,
                                               const QByteArray& payload,
                                               quint16 groupId,
                                               QString* errorMessage) {
-    if (!binaryProtocolEnabled_) {
-        return rejectOperation(QStringLiteral("开发配置仅支持正式二进制协议"), errorMessage);
-    }
     if (transport_ == nullptr || !transport_->isOpen()) {
         return rejectOperation(QStringLiteral("串口未连接"), errorMessage);
     }
@@ -441,12 +372,17 @@ bool PaDeviceController::sendRawBinaryRequest(quint16 command,
     rawBinaryPending_ = true;
     pendingBinaryCommand_ = command;
     pendingConfigGroup_ = groupId;
+    pendingBinaryFrame_ = frame;
+    binaryRetryCount_ = 0;
+    pendingTimeoutMs_ = commandTimeoutFor(command, commandTimeoutMs_);
     setState(PaDeviceState::Busy);
     QString transportError;
     if (!transport_->sendBinaryFrame(frame, &transportError)) {
         rawBinaryPending_ = false;
         pendingBinaryCommand_ = 0;
         pendingConfigGroup_ = 0;
+        pendingBinaryFrame_ = {};
+        binaryRetryCount_ = 0;
         const QString message = transportError.isEmpty() ? QStringLiteral("二进制配置命令发送失败") : transportError;
         setState(PaDeviceState::Error);
         if (errorMessage) *errorMessage = message;
@@ -459,51 +395,7 @@ bool PaDeviceController::sendRawBinaryRequest(quint16 command,
         .arg(frame.sequence)
         .arg(groupId));
     /* 模板上传会在 ARM 端等待 FPGA 完成中断，覆盖其默认 10 秒等待窗口。 */
-    const int timeoutMs = command == 0x0501 ? qMax(commandTimeoutMs_, 15000) : commandTimeoutMs_;
-    commandTimer_.start(timeoutMs);
-    return true;
-}
-
-void PaDeviceController::setBinaryProtocolEnabled(bool enabled) {
-    if (hasPendingCommand()) {
-        return;
-    }
-    binaryProtocolEnabled_ = enabled;
-    if (transport_ != nullptr) {
-        transport_->setBinaryMode(enabled);
-    }
-}
-
-bool PaDeviceController::binaryProtocolEnabled() const {
-    return binaryProtocolEnabled_;
-}
-
-bool PaDeviceController::sendImmediateCommand(
-    PaProtocol::Command command,
-    QString* errorMessage) {
-    // 停止类命令只负责尽快写到 ARM，不等待响应，避免停止入口被在途命令卡住。
-    commandTimer_.stop();
-    pendingCommand_.reset();
-    pendingSequence_ = 0;
-    setState(PaDeviceState::Busy);
-
-    const QString line = PaProtocol::commandText(command);
-    QString transportError;
-    if (!transport_->sendLine(line, &transportError)) {
-        const QString message = transportError.isEmpty()
-            ? QStringLiteral("即时命令发送失败")
-            : transportError;
-        setState(PaDeviceState::Error);
-        emit errorOccurred(message);
-        if (errorMessage != nullptr) {
-            *errorMessage = message;
-        }
-        return false;
-    }
-
-    emit lineTransmitted(line);
-    setState(PaDeviceState::Ready);
-    emit commandFinished(command, true, QStringLiteral("命令已发送，无需等待响应"));
+    commandTimer_.start(pendingTimeoutMs_);
     return true;
 }
 
@@ -523,10 +415,19 @@ int PaDeviceController::commandTimeoutMs() const {
     return commandTimeoutMs_;
 }
 
+int PaDeviceController::maxCommandRetries() const {
+    return maxBinaryRetries_;
+}
+
+void PaDeviceController::setMaxCommandRetries(int retries) {
+    maxBinaryRetries_ = qBound(0, retries, 10);
+}
+
 void PaDeviceController::setCommandTimeoutMs(int timeoutMs) {
     commandTimeoutMs_ = qMax(1, timeoutMs);
     if (commandTimer_.isActive()) {
-        commandTimer_.start(commandTimeoutMs_);
+        pendingTimeoutMs_ = commandTimeoutFor(pendingBinaryCommand_, commandTimeoutMs_);
+        commandTimer_.start(pendingTimeoutMs_);
     }
 }
 
@@ -551,54 +452,7 @@ void PaDeviceController::handleTransportError(const QString& message) {
     emit errorOccurred(message);
 }
 
-void PaDeviceController::handleLineReceived(const QString& line) {
-    emit lineReceived(line);
-    const PaProtocol::Response response = PaProtocol::parseResponse(line);
-    if (!response.ok && !response.error) {
-        emit errorOccurred(QStringLiteral("无法识别设备响应: %1").arg(line));
-        return;
-    }
-
-    bool payloadValid = true;
-    QString payloadError;
-    if (response.ok && response.keyword == QStringLiteral("STATUS")) {
-        PaDeviceStatus status;
-        payloadValid = parseDeviceStatus(response, &status, &payloadError);
-        if (payloadValid) {
-            emit deviceStatusChanged(status);
-        } else {
-            emit errorOccurred(payloadError);
-        }
-    }
-
-    if (!pendingCommand_.has_value()) {
-        if (response.ok && payloadValid && isConnected()) {
-            setState(PaDeviceState::Ready);
-        } else if (response.error || !payloadValid) {
-            setState(PaDeviceState::Error);
-            if (response.error) {
-                emit errorOccurred(QStringLiteral("设备返回错误: %1").arg(response.rawLine));
-            }
-        }
-        return;
-    }
-
-    if (!responseMatchesPendingCommand(response)) {
-        return;
-    }
-
-    const bool success = response.ok && payloadValid;
-    const QString detail = payloadValid ? response.rawLine : payloadError;
-    finishPendingCommand(success, detail);
-}
-
 void PaDeviceController::handleBinaryFrame(const PaBinaryProtocol::Frame& frame) {
-    emit lineReceived(QStringLiteral("BIN RX type=0x%1 cmd=0x%2 seq=%3 payload=%4")
-        .arg(static_cast<int>(frame.messageType), 2, 16, QLatin1Char('0'))
-        .arg(frame.command, 4, 16, QLatin1Char('0'))
-        .arg(frame.sequence)
-        .arg(QString::fromLatin1(frame.payload.toHex(' '))));
-
     if (rawBinaryPending_) {
         if (frame.sequence != pendingSequence_ || frame.command != pendingBinaryCommand_) return;
         QMap<quint16, quint32> values;
@@ -639,13 +493,15 @@ void PaDeviceController::handleBinaryFrame(const PaBinaryProtocol::Frame& frame)
                                     : transportError);
                 return;
             }
+            pendingBinaryFrame_ = next;
+            binaryRetryCount_ = 0;
             pendingSequence_ = next.sequence;
             emit lineTransmitted(QStringLiteral("BIN REQ cmd=0x%1 seq=%2 group=%3 remaining=%4")
                 .arg(next.command, 4, 16, QLatin1Char('0'))
                 .arg(next.sequence)
                 .arg(pendingConfigGroup_)
                 .arg(pendingRawPayloadChunks_.size()));
-            commandTimer_.start(commandTimeoutMs_);
+            commandTimer_.start(pendingTimeoutMs_);
             return;
         }
         if (pendingBinaryCommand_ == 0x0105) {
@@ -702,6 +558,9 @@ void PaDeviceController::handleBinaryFrame(const PaBinaryProtocol::Frame& frame)
 }
 
 void PaDeviceController::handleCommandTimeout() {
+    if (retryPendingBinaryRequest()) {
+        return;
+    }
     if (rawBinaryPending_) {
         finishRawBinary(false, {}, QStringLiteral("等待二进制配置组响应超时"));
         return;
@@ -711,6 +570,35 @@ void PaDeviceController::handleCommandTimeout() {
     }
     const QString commandName = PaProtocol::commandName(pendingCommand_.value());
     finishPendingCommand(false, QStringLiteral("等待“%1”响应超时").arg(commandName));
+}
+
+bool PaDeviceController::retryPendingBinaryRequest() {
+    if ((!rawBinaryPending_ && !pendingCommand_.has_value()) || transport_ == nullptr ||
+        !transport_->isOpen() || binaryRetryCount_ >= maxBinaryRetries_) {
+        return false;
+    }
+
+    QString transportError;
+    if (!transport_->sendBinaryFrame(pendingBinaryFrame_, &transportError)) {
+        const QString detail = transportError.isEmpty()
+            ? QStringLiteral("二进制命令重发失败")
+            : QStringLiteral("二进制命令重发失败: %1").arg(transportError);
+        if (rawBinaryPending_) {
+            finishRawBinary(false, {}, detail);
+        } else {
+            finishPendingCommand(false, detail);
+        }
+        return true;
+    }
+
+    ++binaryRetryCount_;
+    emit lineTransmitted(QStringLiteral("BIN RETRY cmd=0x%1 seq=%2 attempt=%3/%4")
+        .arg(pendingBinaryFrame_.command, 4, 16, QLatin1Char('0'))
+        .arg(pendingBinaryFrame_.sequence)
+        .arg(binaryRetryCount_)
+        .arg(maxBinaryRetries_));
+    commandTimer_.start(pendingTimeoutMs_);
+    return true;
 }
 
 void PaDeviceController::setState(PaDeviceState state) {
@@ -728,62 +616,13 @@ void PaDeviceController::finishPendingCommand(bool success, const QString& detai
     commandTimer_.stop();
     const PaProtocol::Command command = pendingCommand_.value();
     pendingCommand_.reset();
+    pendingBinaryFrame_ = {};
+    binaryRetryCount_ = 0;
+    pendingSequence_ = 0;
     setState(success
             ? (isConnected() ? PaDeviceState::Ready : PaDeviceState::Disconnected)
             : PaDeviceState::Error);
     emit commandFinished(command, success, detail);
-}
-
-bool PaDeviceController::responseMatchesPendingCommand(
-    const PaProtocol::Response& response) const {
-    if (!pendingCommand_.has_value() || response.error || response.keyword.isEmpty()) {
-        return true;
-    }
-
-    // PONG 和 STATUS 可能迟到，必须与在途命令严格对应。
-    switch (pendingCommand_.value()) {
-    case PaProtocol::Command::Ping:
-        return response.keyword == QStringLiteral("PONG");
-    case PaProtocol::Command::Status:
-        return response.keyword == QStringLiteral("STATUS");
-    default:
-        return response.keyword != QStringLiteral("PONG")
-            && response.keyword != QStringLiteral("STATUS");
-    }
-}
-
-bool PaDeviceController::parseDeviceStatus(
-    const PaProtocol::Response& response,
-    PaDeviceStatus* status,
-    QString* errorMessage) const {
-    if (status == nullptr) {
-        return false;
-    }
-
-    PaDeviceStatus parsed;
-    parsed.rawLine = response.rawLine;
-    parsed.model = response.kv.value(QStringLiteral("model")).trimmed();
-    parsed.serialNumber = response.kv.value(QStringLiteral("serial")).trimmed();
-    parsed.armVersion = response.kv.value(QStringLiteral("arm_version")).trimmed();
-    parsed.fpgaVersion = response.kv.value(QStringLiteral("fpga_version")).trimmed();
-    const bool valid = readUnsignedFieldAny(response.kv, {QStringLiteral("int_vector"), QStringLiteral("int")}, &parsed.interruptVector, false)
-        && readUnsignedFieldAny(response.kv, {QStringLiteral("pa_version"), QStringLiteral("pa")}, &parsed.paVersion)
-        && readUnsignedFieldAny(response.kv, {QStringLiteral("com_version"), QStringLiteral("com")}, &parsed.communicationVersion)
-        && readUnsignedFieldAny(response.kv, {QStringLiteral("rst_state"), QStringLiteral("rst")}, &parsed.resetState)
-        && readIntField(response.kv, QStringLiteral("wr_state"), &parsed.writeState)
-        && readIntField(response.kv, QStringLiteral("wr_end"), &parsed.writeEnd)
-        && readIntField(response.kv, QStringLiteral("corr_state"), &parsed.correctionState)
-        && readIntField(response.kv, QStringLiteral("corr_end"), &parsed.correctionEnd);
-    if (!valid) {
-        if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("STATUS 响应缺少字段或数值无效: %1").arg(response.rawLine);
-        }
-        return false;
-    }
-
-    parsed.valid = true;
-    *status = parsed;
-    return true;
 }
 
 void PaDeviceController::finishRawBinary(bool success,
@@ -797,6 +636,8 @@ void PaDeviceController::finishRawBinary(bool success,
     pendingBinaryCommand_ = 0;
     pendingConfigGroup_ = 0;
     pendingSequence_ = 0;
+    pendingBinaryFrame_ = {};
+    binaryRetryCount_ = 0;
     pendingRawPayloadChunks_.clear();
     setState(success ? (isConnected() ? PaDeviceState::Ready : PaDeviceState::Disconnected)
                      : PaDeviceState::Error);

@@ -64,6 +64,8 @@ bool ImageTransferWorkflowController::startTransfer(QString* errorMessage) {
     QString commandError;
     if (!deviceController_->sendCommand(command, &commandError)) {
         pendingCommand_.reset();
+        // 命令连发送都失败时，不能继续保留“可能正在传输”标志，否则手动上图会永久锁死。
+        transferMayBeActive_ = false;
         setState(ImageTransferState::Error);
         const QString message = commandError.isEmpty()
             ? QStringLiteral("上图命令发送失败")
@@ -118,9 +120,10 @@ bool ImageTransferWorkflowController::canStop() const {
         || !deviceController_->isConnected()) {
         return false;
     }
-    return transferMayBeActive_
-        && (state_ == ImageTransferState::StartingSingle
-            || state_ == ImageTransferState::StartingContinuous
+    // Idle/手动上图是单帧请求，不提供“停止上图”入口；停止只属于持续上图模式。
+    return mode_ == ImageTransferMode::Continuous
+        && transferMayBeActive_
+        && (state_ == ImageTransferState::StartingContinuous
             || state_ == ImageTransferState::ContinuousRunning
             || state_ == ImageTransferState::Error);
 }
@@ -129,6 +132,7 @@ void ImageTransferWorkflowController::handleDeviceStateChanged(PaDeviceState sta
     switch (state) {
     case PaDeviceState::Disconnected:
         pendingCommand_.reset();
+        transferMayBeActive_ = false;
         setState(ImageTransferState::Disconnected);
         break;
     case PaDeviceState::Ready:
@@ -169,12 +173,12 @@ void ImageTransferWorkflowController::handleCommandFinished(
             transferMayBeActive_ = false;
             setState(ImageTransferState::Ready);
         } else if (!success && command == PaProtocol::Command::StartContinuous) {
-            transferMayBeActive_ = true;
+            transferMayBeActive_ = false;
             mode_ = ImageTransferMode::Continuous;
             emit modeChanged(mode_);
             setState(ImageTransferState::Error);
         } else if (!success && command == PaProtocol::Command::SendSingle) {
-            transferMayBeActive_ = true;
+            transferMayBeActive_ = false;
             mode_ = ImageTransferMode::Manual;
             emit modeChanged(mode_);
             setState(ImageTransferState::Error);
@@ -190,6 +194,11 @@ void ImageTransferWorkflowController::handleCommandFinished(
     pendingCommand_.reset();
 
     if (!success) {
+        // 单帧或启动持续上图失败后，允许用户直接重试；停止失败则保留停止入口，便于再次发送停止命令。
+        if (command == PaProtocol::Command::SendSingle
+            || command == PaProtocol::Command::StartContinuous) {
+            transferMayBeActive_ = false;
+        }
         setState(ImageTransferState::Error);
         emit errorOccurred(QStringLiteral("%1失败: %2")
                                .arg(PaProtocol::commandName(command), detail));

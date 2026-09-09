@@ -47,7 +47,7 @@ struct PaDeviceStatus {
 
 /*
  * PA 设备控制层：管理串口连接、单条在途命令、响应解析和超时。
- * 界面只消费结构化状态，不直接处理 ASCII 行或 QSerialPort。
+ * 界面只消费结构化状态，不直接处理串口帧或 QSerialPort。
  */
 class PaDeviceController final : public QObject {
     Q_OBJECT
@@ -67,6 +67,8 @@ public:
     bool dumpRegisters(QString* errorMessage = nullptr);
     /* 开发调试窗口：直接写一个寄存器并等待设备确认。 */
     bool writeRegister(quint16 offset, quint32 value, QString* errorMessage = nullptr);
+    /* 发送设备重启指令；下位机确认接收后会执行系统重启。 */
+    bool restartDevice(QString* errorMessage = nullptr);
     /* Dynamic 状态查询和模板制作均使用正式二进制业务命令。 */
     bool queryDynamic(QString* errorMessage = nullptr);
     bool beginOffsetCalibration(quint32 totalFrames,
@@ -90,14 +92,14 @@ public:
                                  QString* errorMessage = nullptr);
     bool startTemplateUpload(QString* errorMessage = nullptr);
     bool queryTemplateUpload(QString* errorMessage = nullptr);
-    void setBinaryProtocolEnabled(bool enabled);
-    bool binaryProtocolEnabled() const;
 
     bool isConnected() const;
     bool hasPendingCommand() const;
     PaDeviceState state() const;
     int commandTimeoutMs() const;
     void setCommandTimeoutMs(int timeoutMs);
+    int maxCommandRetries() const;
+    void setMaxCommandRetries(int retries);
 
 signals:
     void stateChanged(PaDeviceState state);
@@ -118,30 +120,23 @@ signals:
                                bool success,
                                const QString& detail);
     void lineTransmitted(const QString& line);
-    void lineReceived(const QString& line);
     void errorOccurred(const QString& message);
 
 private:
-    bool sendImmediateCommand(PaProtocol::Command command, QString* errorMessage);
     bool sendRawBinaryRequest(quint16 command,
                               const QByteArray& payload,
                               quint16 groupId,
                               QString* errorMessage);
     void handleTransportConnectionChanged(bool connected);
     void handleTransportError(const QString& message);
-    void handleLineReceived(const QString& line);
     void handleBinaryFrame(const PaBinaryProtocol::Frame& frame);
     void handleCommandTimeout();
+    bool retryPendingBinaryRequest();
     void setState(PaDeviceState state);
     void finishPendingCommand(bool success, const QString& detail);
     void finishRawBinary(bool success,
                          const QMap<quint16, quint32>& values,
                          const QString& detail);
-    bool responseMatchesPendingCommand(const PaProtocol::Response& response) const;
-    bool parseDeviceStatus(
-        const PaProtocol::Response& response,
-        PaDeviceStatus* status,
-        QString* errorMessage) const;
     bool parseBinaryDeviceStatus(
         const PaBinaryProtocol::Frame& frame,
         PaDeviceStatus* status,
@@ -156,11 +151,14 @@ private:
     quint16 pendingConfigGroup_ = 0;
     quint32 pendingSequence_ = 0;
     quint32 nextSequence_ = 1;
+    PaBinaryProtocol::Frame pendingBinaryFrame_;
+    int binaryRetryCount_ = 0;
+    int maxBinaryRetries_ = 2;
+    int pendingTimeoutMs_ = 5000;
     /* SET_CONFIG_GROUP 超过 8 项时按多帧顺序发送，避免大 payload 占满 RS422。 */
     QList<QByteArray> pendingRawPayloadChunks_;
-    bool binaryProtocolEnabled_ = false;
     PaDeviceState state_ = PaDeviceState::Disconnected;
-    int commandTimeoutMs_ = 5000;
+    int commandTimeoutMs_ = 500;
 };
 
 Q_DECLARE_METATYPE(PaDeviceState)

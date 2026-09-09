@@ -226,9 +226,6 @@ int main(int argc, char* argv[]) {
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("TiRay PA Host"));
     parser.addHelpOption();
-    parser.addOption(QCommandLineOption(
-        QStringLiteral("binary"),
-        QStringLiteral("使用正式 RS422 二进制协议；默认使用 ASCII 兼容协议")));
     parser.process(app);
     QApplication::setStyle(QStyleFactory::create("Fusion"));
     QApplication::setApplicationName("PA Host");
@@ -237,7 +234,6 @@ int main(int argc, char* argv[]) {
     app.setStyleSheet(QString::fromUtf8(kAppStyleSheet));
 
     MainWindow window;
-    window.setBinaryProtocolEnabled(parser.isSet(QStringLiteral("binary")));
     window.show();
 
     return app.exec();

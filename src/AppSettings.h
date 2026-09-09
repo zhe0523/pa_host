@@ -29,9 +29,6 @@ public:
     void setSerialPort(const QString& portName);
     int serialBaudRate() const;
     void setSerialBaudRate(int baudRate);
-    int commandTimeoutMs() const;
-    void setCommandTimeoutMs(int timeoutMs);
-
     void sync();
 
 private:

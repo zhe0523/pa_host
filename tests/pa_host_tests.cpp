@@ -67,19 +67,6 @@ public:
         return lastPortName;
     }
 
-    bool sendLine(const QString& line, QString* errorMessage) override {
-        if (!openState || failSend) {
-            if (errorMessage != nullptr) {
-                *errorMessage = failSend
-                    ? QStringLiteral("模拟发送失败")
-                    : QStringLiteral("模拟传输未打开");
-            }
-            return false;
-        }
-        sentLines.push_back(line);
-        return true;
-    }
-
     bool sendBinaryFrame(const PaBinaryProtocol::Frame& frame, QString* errorMessage) override {
         if (!openState || failSend) {
             if (errorMessage != nullptr) *errorMessage = QStringLiteral("模拟二进制发送失败");
@@ -87,14 +74,6 @@ public:
         }
         sentBinaryFrames.push_back(frame);
         return true;
-    }
-
-    void setBinaryMode(bool enabled) override {
-        binaryMode = enabled;
-    }
-
-    void injectLine(const QString& line) {
-        emit lineReceived(line);
     }
 
     void injectError(const QString& message) {
@@ -110,9 +89,7 @@ public:
     bool failSend = false;
     QString lastPortName;
     int lastBaudRate = 0;
-    QStringList sentLines;
     QList<PaBinaryProtocol::Frame> sentBinaryFrames;
-    bool binaryMode = false;
 };
 
 class FakeImageSource final : public IImageSource {
@@ -233,41 +210,6 @@ bool fuzzyEqual(double actual, double expected, double tolerance = 1e-6) {
     return std::abs(actual - expected) <= tolerance;
 }
 
-bool testProtocolCommands() {
-    CHECK(PaProtocol::commandText(PaProtocol::Command::Ping) == QStringLiteral("PING"));
-    CHECK(PaProtocol::commandText(PaProtocol::Command::SendSingle) == QStringLiteral("SEND_SINGLE"));
-    CHECK(PaProtocol::commandText(PaProtocol::Command::StartContinuous) == QStringLiteral("START_CONTINUOUS"));
-    CHECK(PaProtocol::commandText(PaProtocol::Command::StopTransfer) == QStringLiteral("STOP_TRANSFER"));
-    CHECK(PaProtocol::commandText(PaProtocol::Command::StopDynamic) == QStringLiteral("STOP_DYNC"));
-    CHECK(PaProtocol::commandName(PaProtocol::Command::SendSingle) == QStringLiteral("手动上图"));
-    CHECK(PaProtocol::commandNames().size() == 11);
-    return true;
-}
-
-bool testProtocolResponses() {
-    const auto status = PaProtocol::parseResponse(
-        QStringLiteral("  OK   STATUS pa_version=0x10 wr_state=2 corr_end=1  \r\n"));
-    CHECK(status.ok);
-    CHECK(!status.error);
-    CHECK(status.keyword == QStringLiteral("STATUS"));
-    CHECK(status.rawLine == QStringLiteral("OK   STATUS pa_version=0x10 wr_state=2 corr_end=1"));
-    CHECK(status.kv.value(QStringLiteral("pa_version")) == QStringLiteral("0x10"));
-    CHECK(status.kv.value(QStringLiteral("wr_state")) == QStringLiteral("2"));
-    CHECK(status.kv.value(QStringLiteral("corr_end")) == QStringLiteral("1"));
-
-    const auto error = PaProtocol::parseResponse(QStringLiteral("ERR UNKNOWN reason=bad"));
-    CHECK(!error.ok);
-    CHECK(error.error);
-    CHECK(error.keyword == QStringLiteral("UNKNOWN"));
-    CHECK(error.kv.value(QStringLiteral("reason")) == QStringLiteral("bad"));
-
-    const auto empty = PaProtocol::parseResponse(QStringLiteral("   \r\n"));
-    CHECK(!empty.ok);
-    CHECK(!empty.error);
-    CHECK(empty.keyword.isEmpty());
-    return true;
-}
-
 void appendLe32(QByteArray* data, quint32 value) {
     data->append(static_cast<char>(value & 0xff));
     data->append(static_cast<char>((value >> 8) & 0xff));
@@ -331,14 +273,12 @@ bool testAppSettings() {
         CHECK(settings.serialPort() == QStringLiteral("/dev/ttyWCH0"));
 #endif
         CHECK(settings.serialBaudRate() == 115200);
-        CHECK(settings.commandTimeoutMs() == 5000);
         settings.setLastImageDirectory(QStringLiteral("/tmp/images"));
         settings.setLastSaveDirectory(QStringLiteral("/tmp/save"));
         settings.setLastExportDirectory(QStringLiteral("/tmp/export"));
         settings.setLastDiagnosticDirectory(QStringLiteral("/tmp/diagnostics"));
         settings.setSerialPort(QStringLiteral("COM_TEST"));
         settings.setSerialBaudRate(921600);
-        settings.setCommandTimeoutMs(12000);
         settings.sync();
     }
 
@@ -350,12 +290,9 @@ bool testAppSettings() {
         CHECK(settings.lastDiagnosticDirectory() == QStringLiteral("/tmp/diagnostics"));
         CHECK(settings.serialPort() == QStringLiteral("COM_TEST"));
         CHECK(settings.serialBaudRate() == 921600);
-        CHECK(settings.commandTimeoutMs() == 12000);
 
         settings.setSerialBaudRate(1);
-        settings.setCommandTimeoutMs(999999);
         CHECK(settings.serialBaudRate() == 1200);
-        CHECK(settings.commandTimeoutMs() == 300000);
     }
     return true;
 }
@@ -418,6 +355,7 @@ bool testAppLogService() {
     return true;
 }
 
+#if 0 // 旧文本协议测试已移除；主机仅保留二进制协议。
 bool testPaDeviceController() {
     struct CommandResult {
         PaProtocol::Command command;
@@ -553,6 +491,7 @@ bool testPaDeviceController() {
     CHECK(!errors.isEmpty());
     return true;
 }
+#endif
 
 bool testPaDeviceBinaryBusinessCommands() {
     struct Result {
@@ -570,9 +509,6 @@ bool testPaDeviceBinaryBusinessCommands() {
         });
     QString error;
     CHECK(controller.connectDevice(QStringLiteral("COM_BINARY"), 115200, &error));
-    controller.setBinaryProtocolEnabled(true);
-    CHECK(transport.binaryMode);
-
     CHECK(controller.beginOffsetCalibration(12, 8, 1, &error));
     CHECK(transport.sentBinaryFrames.last().command == 0x0300);
     CHECK(transport.sentBinaryFrames.last().payload.toHex()
@@ -645,6 +581,52 @@ bool testPaDeviceBinaryBusinessCommands() {
     return true;
 }
 
+bool testPaDeviceBinaryRetryPolicy() {
+    FakeLineTransport transport;
+    PaDeviceController controller(&transport);
+    QString error;
+    CHECK(controller.connectDevice(QStringLiteral("COM_RETRY"), 115200, &error));
+    controller.setCommandTimeoutMs(10);
+    controller.setMaxCommandRetries(2);
+
+    CHECK(controller.sendCommand(PaProtocol::Command::Ping, &error));
+    QEventLoop retryLoop;
+    QTimer::singleShot(150, &retryLoop, &QEventLoop::quit);
+    retryLoop.exec();
+    CHECK(transport.sentBinaryFrames.size() == 3);
+    CHECK(transport.sentBinaryFrames.at(0).sequence == transport.sentBinaryFrames.at(1).sequence);
+    CHECK(transport.sentBinaryFrames.at(1).sequence == transport.sentBinaryFrames.at(2).sequence);
+    CHECK(controller.state() == PaDeviceState::Error);
+    CHECK(!controller.hasPendingCommand());
+
+    controller.setMaxCommandRetries(0);
+    const int sentBeforeNoRetry = transport.sentBinaryFrames.size();
+    CHECK(controller.sendCommand(PaProtocol::Command::Ping, &error));
+    QEventLoop noRetryLoop;
+    QTimer::singleShot(80, &noRetryLoop, &QEventLoop::quit);
+    noRetryLoop.exec();
+    CHECK(transport.sentBinaryFrames.size() == sentBeforeNoRetry + 1);
+    CHECK(controller.state() == PaDeviceState::Error);
+
+    controller.setMaxCommandRetries(2);
+    CHECK(controller.sendCommand(PaProtocol::Command::Ping, &error));
+    const quint32 sequence = transport.sentBinaryFrames.last().sequence;
+    QEventLoop oneRetryLoop;
+    QTimer::singleShot(30, &oneRetryLoop, &QEventLoop::quit);
+    oneRetryLoop.exec();
+    CHECK(transport.sentBinaryFrames.size() >= sentBeforeNoRetry + 2);
+    CHECK(transport.sentBinaryFrames.last().sequence == sequence);
+    PaBinaryProtocol::Frame done;
+    done.messageType = PaBinaryProtocol::MessageType::Done;
+    done.command = 0x0002;
+    done.sequence = sequence;
+    transport.injectBinaryFrame(done);
+    CHECK(controller.state() == PaDeviceState::Ready);
+    CHECK(!controller.hasPendingCommand());
+    return true;
+}
+
+#if 0 // 旧文本协议测试已移除；主机仅保留二进制协议。
 bool testImageTransferWorkflowController() {
     FakeLineTransport transport;
     PaDeviceController deviceController(&transport);
@@ -755,6 +737,7 @@ bool testImageTransferWorkflowController() {
     CHECK(!workflow.canStart());
     return true;
 }
+#endif
 
 bool testTirawParsingAndRoi() {
     QTemporaryDir directory;
@@ -1220,14 +1203,11 @@ int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
 
     const TestCase tests[] = {
-        {"protocol_commands", testProtocolCommands},
-        {"protocol_responses", testProtocolResponses},
         {"binary_protocol", testBinaryProtocol},
         {"app_settings", testAppSettings},
         {"app_log_service", testAppLogService},
-        {"pa_device_controller", testPaDeviceController},
         {"pa_device_binary_business_commands", testPaDeviceBinaryBusinessCommands},
-        {"image_transfer_workflow_controller", testImageTransferWorkflowController},
+        {"pa_device_binary_retry_policy", testPaDeviceBinaryRetryPolicy},
         {"tiraw_parsing_and_roi", testTirawParsingAndRoi},
         {"auto_window_level", testAutoWindowLevel},
         {"image_algorithm_boundary", testImageAlgorithmBoundary},

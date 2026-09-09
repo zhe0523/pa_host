@@ -24,6 +24,14 @@
 
 namespace {
 #ifndef Q_OS_WIN
+QString imageTypeName(std::uint32_t imageType) {
+    if (imageType == 0u) return QStringLiteral("正常图片");
+    if (imageType == 1u) return QStringLiteral("模板上传");
+    return QStringLiteral("未知类型(%1)").arg(imageType);
+}
+#endif
+
+#ifndef Q_OS_WIN
 constexpr int kBar0MapSize = 4096;
 constexpr int kIoChunkSize = 1 << 20;
 constexpr int kStopPollSliceMs = 200;
@@ -190,6 +198,7 @@ void PcieImageSource::run() {
         if (haveLastMetadata
             && metadata.imageId == lastMetadata.imageId
             && metadata.finalImageAddress == lastMetadata.finalImageAddress
+            && metadata.imageType == lastMetadata.imageType
             && metadata.rowCount == lastMetadata.rowCount
             && metadata.columnCount == lastMetadata.columnCount) {
             continue;
@@ -207,8 +216,9 @@ void PcieImageSource::run() {
         const qint64 c2hMs = stageTimer.elapsed();
 
         TiRawImage image;
-        const QString sourceName = QStringLiteral("PCIe #%1 @0x%2")
+        const QString sourceName = QStringLiteral("PCIe #%1 [%2] @0x%3")
             .arg(metadata.imageId)
+            .arg(imageTypeName(metadata.imageType))
             .arg(metadata.finalImageAddress, 0, 16);
         stageTimer.restart();
         if (metadata.columnCount > static_cast<std::uint32_t>(std::numeric_limits<int>::max())
@@ -235,6 +245,8 @@ void PcieImageSource::run() {
         ImageFrame frame;
         frame.image = std::move(image);
         frame.sourceName = sourceName;
+        frame.sourceImageType = metadata.imageType;
+        frame.sourceImageTypeValid = true;
         frame.sequence = deliveredFrames_.load();
         frame.receivedAt = QDateTime::currentDateTimeUtc();
         ++deliveredFrames_;
@@ -242,8 +254,10 @@ void PcieImageSource::run() {
         const qint64 emitMs = totalTimer.elapsed();
 
         emit captureInfo(QStringLiteral(
-            "PCIe 图像已进入显示队列: id=%1 event=0x%2 final_addr=0x%3 c2h_offset=0x%4 size=%5x%6 bytes=%7 wait=%8ms bar0=%9ms c2h=%10ms parse=%11ms emit_total=%12ms")
+            "PCIe 图像已进入显示队列: id=%1 type=%2(%3) event=0x%4 final_addr=0x%5 c2h_offset=0x%6 size=%7x%8 bytes=%9 wait=%10ms bar0=%11ms c2h=%12ms parse=%13ms emit_total=%14ms")
                 .arg(metadata.imageId)
+                .arg(metadata.imageType)
+                .arg(imageTypeName(metadata.imageType))
                 .arg(eventValue, 0, 16)
                 .arg(metadata.finalImageAddress, 0, 16)
                 .arg(metadata.c2hOffset, 0, 16)
@@ -299,8 +313,10 @@ void PcieImageSource::runSaver() {
             std::chrono::steady_clock::now() - job.interruptAt).count();
         const qint64 queueMs = std::max<qint64>(0, totalMs - job.displayQueuedMs - saveMs);
         emit captureInfo(QStringLiteral(
-            "PCIe 图像文件已保存: id=%1 queue=%2ms save=%3ms total=%4ms path=%5")
+            "PCIe 图像文件已保存: id=%1 type=%2(%3) queue=%4ms save=%5ms total=%6ms path=%7")
                 .arg(job.metadata.imageId)
+                .arg(job.metadata.imageType)
+                .arg(imageTypeName(job.metadata.imageType))
                 .arg(queueMs)
                 .arg(saveMs)
                 .arg(totalMs)
@@ -544,9 +560,10 @@ bool PcieImageSource::saveFrameFile(
     }
 
     const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
-    const QString fileName = QStringLiteral("pcie_%1_id%2_%3x%4_addr0x%5.tiraw")
+    const QString fileName = QStringLiteral("pcie_%1_id%2_type%3_%4x%5_addr0x%6.tiraw")
         .arg(timestamp)
         .arg(metadata.imageId)
+        .arg(metadata.imageType)
         .arg(image.width())
         .arg(image.height())
         .arg(metadata.finalImageAddress, 0, 16);

@@ -14,6 +14,9 @@ struct ImageFrame {
     // 非空表示内容在当前会话内稳定，可安全复用显示图和统计缓存。
     QString contentCacheKey;
     quint64 sequence = 0;
+    /* PCIe BAR0[0x018]：0=正常图片，1=模板上传。非 PCIe 图像保持 false。 */
+    quint32 sourceImageType = 0;
+    bool sourceImageTypeValid = false;
     QDateTime receivedAt;
 };
 

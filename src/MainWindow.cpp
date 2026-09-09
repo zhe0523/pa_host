@@ -28,7 +28,6 @@
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QGuiApplication>
-#include <QInputDialog>
 #include <QKeySequence>
 #include <QLineEdit>
 #include <QMenuBar>
@@ -317,7 +316,6 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
     pcieSource_ = new PcieImageSource(this);
     acquisitionController_ = new ImageAcquisitionController(this);
     deviceController_ = new PaDeviceController(&serial_, this);
-    deviceController_->setCommandTimeoutMs(settings_->commandTimeoutMs());
     imageTransferController_ = new ImageTransferWorkflowController(deviceController_, this);
     imageFrameCache_.setMaxCost(kCachedRawFrameCount);
     frameDisplayCache_.setMaxCost(kCachedDisplayFrameCount);
@@ -396,9 +394,6 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
         });
     connect(deviceController_, &PaDeviceController::lineTransmitted, this, [this](const QString& line) {
         logService_->info(QStringLiteral("RS422"), QStringLiteral("TX: %1").arg(line));
-    });
-    connect(deviceController_, &PaDeviceController::lineReceived, this, [this](const QString& line) {
-        logService_->info(QStringLiteral("RS422"), QStringLiteral("RX: %1").arg(line));
     });
     connect(deviceController_, &PaDeviceController::errorOccurred, this, [this](const QString& message) {
         logService_->error(QStringLiteral("RS422"), QStringLiteral("控制错误: %1").arg(message));
@@ -482,18 +477,6 @@ MainWindow::MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* pa
 #ifndef Q_OS_WIN
     QTimer::singleShot(0, this, &MainWindow::startPcieCapture);
 #endif
-}
-
-void MainWindow::setBinaryProtocolEnabled(bool enabled) {
-    if (deviceController_ == nullptr) {
-        return;
-    }
-    deviceController_->setBinaryProtocolEnabled(enabled);
-    if (logService_ != nullptr) {
-        logService_->info(QStringLiteral("RS422"), enabled
-            ? QStringLiteral("已启用正式二进制协议模式")
-            : QStringLiteral("使用 ASCII 兼容协议模式"));
-    }
 }
 
 void MainWindow::openImage() {
@@ -683,6 +666,8 @@ void MainWindow::exportDiagnostics() {
     metadata.insert(QStringLiteral("serial.baud"), QString::number(baudSpin_->value()));
     metadata.insert(QStringLiteral("control.command_timeout_ms"),
         QString::number(deviceController_->commandTimeoutMs()));
+    metadata.insert(QStringLiteral("control.max_command_retries"),
+        QString::number(deviceController_->maxCommandRetries()));
     metadata.insert(QStringLiteral("control.device_state"),
         deviceStateName(deviceController_->state()));
     metadata.insert(QStringLiteral("log.directory"), logService_->logDirectory());
@@ -700,24 +685,41 @@ void MainWindow::exportDiagnostics() {
 }
 
 void MainWindow::configureCommandTimeout() {
-    bool accepted = false;
-    const int timeoutMs = QInputDialog::getInt(
-        this,
-        QStringLiteral("命令超时设置"),
-        QStringLiteral("响应超时 (ms)"),
-        deviceController_->commandTimeoutMs(),
-        100,
-        300000,
-        100,
-        &accepted);
-    if (!accepted) {
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("命令超时设置"));
+    auto* form = new QFormLayout(&dialog);
+
+    auto* timeoutSpin = new QSpinBox(&dialog);
+    timeoutSpin->setRange(100, 300000);
+    timeoutSpin->setSingleStep(100);
+    timeoutSpin->setSuffix(QStringLiteral(" ms"));
+    timeoutSpin->setValue(deviceController_->commandTimeoutMs());
+    form->addRow(QStringLiteral("响应超时"), timeoutSpin);
+
+    auto* retrySpin = new QSpinBox(&dialog);
+    retrySpin->setRange(0, 10);
+    retrySpin->setValue(deviceController_->maxCommandRetries());
+    form->addRow(QStringLiteral("最大重试次数"), retrySpin);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+                                         Qt::Horizontal,
+                                         &dialog);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    if (dialog.exec() != QDialog::Accepted) {
         return;
     }
 
+    const int timeoutMs = timeoutSpin->value();
+    const int maxRetries = retrySpin->value();
     deviceController_->setCommandTimeoutMs(timeoutMs);
-    settings_->setCommandTimeoutMs(timeoutMs);
+    deviceController_->setMaxCommandRetries(maxRetries);
     logService_->info(QStringLiteral("SYSTEM"),
-        QStringLiteral("命令响应超时设置为 %1 ms").arg(timeoutMs));
+        QStringLiteral("命令可靠性设置：响应超时 %1 ms，最大重试 %2 次")
+            .arg(timeoutMs)
+            .arg(maxRetries));
 }
 
 void MainWindow::updateWindowLevel() {
@@ -1025,6 +1027,7 @@ void MainWindow::createMenus() {
     toolsMenu->addSeparator();
     toolsMenu->addAction(QStringLiteral("Dynamic 配置"), this, &MainWindow::showDynamicConfigDialog);
     toolsMenu->addAction(QStringLiteral("Dynamic 查询"), this, &MainWindow::queryDynamicStatus);
+    toolsMenu->addAction(QStringLiteral("重启设备"), this, &MainWindow::restartDevice);
     toolsMenu->addSeparator();
     toolsMenu->addAction(QStringLiteral("开发"), this, &MainWindow::showDeveloperDialog);
     toolsMenu->addAction(QStringLiteral("调试"), this, &MainWindow::showDebugDialog);
@@ -1032,11 +1035,28 @@ void MainWindow::createMenus() {
     helpMenu->addAction(QStringLiteral("关于 PA Host"), this, &MainWindow::showAbout);
 }
 
+void MainWindow::restartDevice() {
+    if (deviceController_ == nullptr || !deviceController_->isConnected()) {
+        QMessageBox::warning(this, QStringLiteral("重启设备"), QStringLiteral("请先连接 RS422 设备。"));
+        return;
+    }
+    if (QMessageBox::question(this, QStringLiteral("重启设备"),
+                              QStringLiteral("确定要重启下位机设备吗？当前任务和串口连接将中断。"))
+        != QMessageBox::Yes) {
+        return;
+    }
+    QString error;
+    if (!deviceController_->restartDevice(&error)) {
+        QMessageBox::warning(this, QStringLiteral("重启设备"), error);
+        return;
+    }
+    statusBar()->showMessage(QStringLiteral("已发送重启指令，设备正在重启。"), 5000);
+}
+
 void MainWindow::showOffsetTemplateDialog() {
-    if (deviceController_ == nullptr || !deviceController_->isConnected()
-        || !deviceController_->binaryProtocolEnabled()) {
+    if (deviceController_ == nullptr || !deviceController_->isConnected()) {
         QMessageBox::warning(this, QStringLiteral("制作暗场模板"),
-                             QStringLiteral("请先连接设备并启用正式二进制协议。"));
+                             QStringLiteral("请先连接设备。"));
         return;
     }
     QDialog dialog(this);
@@ -1157,10 +1177,9 @@ void MainWindow::showOffsetTemplateDialog() {
 }
 
 void MainWindow::showGainTemplateDialog() {
-    if (deviceController_ == nullptr || !deviceController_->isConnected()
-        || !deviceController_->binaryProtocolEnabled()) {
+    if (deviceController_ == nullptr || !deviceController_->isConnected()) {
         QMessageBox::warning(this, QStringLiteral("制作亮场模板"),
-                             QStringLiteral("请先连接设备并启用正式二进制协议。"));
+                             QStringLiteral("请先连接设备。"));
         return;
     }
     QDialog dialog(this);
@@ -1352,10 +1371,9 @@ void MainWindow::startTemplateUpload(bool gainTemplate) {
                                  QStringLiteral("上一张模板仍在等待上传，请稍候。"));
         return;
     }
-    if (deviceController_ == nullptr || !deviceController_->isConnected()
-        || !deviceController_->binaryProtocolEnabled()) {
+    if (deviceController_ == nullptr || !deviceController_->isConnected()) {
         QMessageBox::warning(this, QStringLiteral("查看模板"),
-                             QStringLiteral("请先连接设备并启用正式二进制协议。"));
+                             QStringLiteral("请先连接设备。"));
         return;
     }
     if (pcieSource_ == nullptr || !pcieSource_->isRunning()) {
@@ -1377,10 +1395,9 @@ void MainWindow::startTemplateUpload(bool gainTemplate) {
 }
 
 void MainWindow::showDynamicConfigDialog() {
-    if (deviceController_ == nullptr || !deviceController_->isConnected()
-        || !deviceController_->binaryProtocolEnabled()) {
+    if (deviceController_ == nullptr || !deviceController_->isConnected()) {
         QMessageBox::warning(this, QStringLiteral("Dynamic 配置"),
-                             QStringLiteral("请先连接设备并启用正式二进制协议。"));
+                             QStringLiteral("请先连接设备。"));
         return;
     }
 
@@ -1463,10 +1480,9 @@ void MainWindow::showDynamicConfigDialog() {
 }
 
 void MainWindow::queryDynamicStatus() {
-    if (deviceController_ == nullptr || !deviceController_->isConnected()
-        || !deviceController_->binaryProtocolEnabled()) {
+    if (deviceController_ == nullptr || !deviceController_->isConnected()) {
         QMessageBox::warning(this, QStringLiteral("Dynamic 查询"),
-                             QStringLiteral("请先连接设备并启用正式二进制协议。"));
+                             QStringLiteral("请先连接设备。"));
         return;
     }
     QString error;
@@ -1545,10 +1561,6 @@ void MainWindow::showDeveloperDialog() {
         QMessageBox::warning(this, QStringLiteral("开发参数"), QStringLiteral("请先连接 RS422 设备。"));
         return;
     }
-    if (!deviceController_->binaryProtocolEnabled()) {
-        QMessageBox::warning(this, QStringLiteral("开发参数"), QStringLiteral("开发参数窗口需要启用正式二进制协议。"));
-        return;
-    }
 
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("开发参数"));
@@ -1567,7 +1579,8 @@ void MainWindow::showDeveloperDialog() {
             auto* rowLayout = new QHBoxLayout(row);
             rowLayout->setContentsMargins(0, 0, 0, 0);
             auto* edit = new QLineEdit(row);
-            const bool defaultHex = item.first == 0x0601 || item.first == 0x0602
+            const bool defaultHex = (item.first >= 0x0500 && item.first <= 0x0515)
+                || item.first == 0x0601 || item.first == 0x0602
                 || (item.first >= 0x2100 && item.first <= 0x2190
                     && ((item.first - 0x2100) % 0x10) == 0);
             auto* hex = new QCheckBox(QStringLiteral("Hex"), row);
@@ -1605,7 +1618,17 @@ void MainWindow::showDeveloperDialog() {
         {0x0404, QStringLiteral("结束行")} });
     addGroup(QStringLiteral("ROIC"), 4, {
         {0x0500, QStringLiteral("起始列")}, {0x0501, QStringLiteral("结束列")},
-        {0x0502, QStringLiteral("Binning")} });
+        {0x0502, QStringLiteral("Binning")},
+        {0x0503, QStringLiteral("ROIC Reg 0x00")}, {0x0504, QStringLiteral("ROIC Reg 0x02")},
+        {0x0505, QStringLiteral("ROIC Reg 0x05")}, {0x0506, QStringLiteral("ROIC Reg 0x06")},
+        {0x0507, QStringLiteral("ROIC Reg 0x07")}, {0x0508, QStringLiteral("ROIC Reg 0x09")},
+        {0x0509, QStringLiteral("ROIC Reg 0x0A")}, {0x050A, QStringLiteral("ROIC Reg 0x0B")},
+        {0x050B, QStringLiteral("ROIC Reg 0x0C")}, {0x050C, QStringLiteral("ROIC Reg 0x0D")},
+        {0x050D, QStringLiteral("ROIC Reg 0x0E")}, {0x050E, QStringLiteral("ROIC Reg 0x0F")},
+        {0x050F, QStringLiteral("ROIC Reg 0x10")}, {0x0510, QStringLiteral("ROIC Reg 0x11")},
+        {0x0511, QStringLiteral("ROIC Reg 0x17")}, {0x0512, QStringLiteral("ROIC Reg 0x24")},
+        {0x0513, QStringLiteral("ROIC Reg 0x28")}, {0x0514, QStringLiteral("ROIC Reg 0x2D")},
+        {0x0515, QStringLiteral("ROIC Reg 0x3B")} });
     addGroup(QStringLiteral("动态模式"), 5, {
         {0x0600, QStringLiteral("循环次数")}, {0x0601, QStringLiteral("图像起始地址")},
         {0x0602, QStringLiteral("图像结束地址")}, {0x0603, QStringLiteral("启动等待(ms)")},
@@ -1632,7 +1655,9 @@ void MainWindow::showDeveloperDialog() {
         {1, {0x1000, 0x1001, 0x1002}},
         {2, {0x0300, 0x0301, 0x0302, 0x0303, 0x0304}},
         {3, {0x0400, 0x0401, 0x0402, 0x0403, 0x0404, 0x0405}},
-        {4, {0x0500, 0x0501, 0x0502}},
+        {4, {0x0500, 0x0501, 0x0502, 0x0503, 0x0504, 0x0505, 0x0506, 0x0507,
+             0x0508, 0x0509, 0x050A, 0x050B, 0x050C, 0x050D, 0x050E, 0x050F,
+             0x0510, 0x0511, 0x0512, 0x0513, 0x0514, 0x0515}},
         {5, {0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605,
              0x2100, 0x2101, 0x2110, 0x2111, 0x2120, 0x2121,
              0x2130, 0x2131, 0x2140, 0x2141, 0x2150, 0x2151,
@@ -1714,10 +1739,6 @@ void MainWindow::showDeveloperDialog() {
 void MainWindow::showDebugDialog() {
     if (deviceController_ == nullptr || !deviceController_->isConnected()) {
         QMessageBox::warning(this, QStringLiteral("调试"), QStringLiteral("请先连接 RS422 设备。"));
-        return;
-    }
-    if (!deviceController_->binaryProtocolEnabled()) {
-        QMessageBox::warning(this, QStringLiteral("调试"), QStringLiteral("调试窗口需要启用正式二进制协议。"));
         return;
     }
 
@@ -2439,9 +2460,22 @@ void MainWindow::handlePresentedFrame(const ImageFrame& frame) {
     }
 
     stageTimer.restart();
-    imageLabel_->setText(QStringLiteral("图像尺寸: %1 x %2")
-                             .arg(presentedFrame.image.width())
-                             .arg(presentedFrame.image.height()));
+    QString imageTypeText;
+    if (presentedFrame.sourceImageTypeValid) {
+        imageTypeText = presentedFrame.sourceImageType == 1u
+            ? QStringLiteral("模板上传")
+            : presentedFrame.sourceImageType == 0u
+                ? QStringLiteral("正常图片")
+                : QStringLiteral("未知类型(%1)").arg(presentedFrame.sourceImageType);
+    }
+    imageLabel_->setText(imageTypeText.isEmpty()
+        ? QStringLiteral("图像尺寸: %1 x %2")
+              .arg(presentedFrame.image.width())
+              .arg(presentedFrame.image.height())
+        : QStringLiteral("图像尺寸: %1 x %2  类型: %3")
+              .arg(presentedFrame.image.width())
+              .arg(presentedFrame.image.height())
+              .arg(imageTypeText));
     updateImageUiState();
     const bool stableContent = !presentedFrame.contentCacheKey.isEmpty();
     imageView_->setPixmapCacheEnabled(stableContent);

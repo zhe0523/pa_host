@@ -55,8 +55,6 @@ public:
     explicit MainWindow(std::shared_ptr<IImageAlgorithms> algorithms, QWidget* parent = nullptr);
     ~MainWindow() override;
 
-    /* 启动时选择正式二进制协议；默认仍是研发 ASCII 兼容模式。 */
-    void setBinaryProtocolEnabled(bool enabled);
 
 private slots:
     void openImage();
@@ -76,6 +74,7 @@ private slots:
     void viewGainTemplate();
     void showDynamicConfigDialog();
     void queryDynamicStatus();
+    void restartDevice();
     void showDeveloperDialog();
     void showDebugDialog();
 

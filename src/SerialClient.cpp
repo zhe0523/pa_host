@@ -13,7 +13,6 @@ bool SerialClient::open(const QString& portName, int baudRate, QString* errorMes
         serial_.close();
     }
 
-    rxBuffer_.clear();
     binaryParser_.reset();
     serial_.setPortName(portName);
     serial_.setBaudRate(baudRate);
@@ -38,7 +37,6 @@ void SerialClient::close() {
     if (serial_.isOpen()) {
         serial_.close();
     }
-    rxBuffer_.clear();
     emit connectionChanged(false);
 }
 
@@ -48,36 +46,6 @@ bool SerialClient::isOpen() const {
 
 QString SerialClient::portName() const {
     return serial_.portName();
-}
-
-bool SerialClient::sendLine(const QString& line, QString* errorMessage) {
-    if (binaryMode_) {
-        if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("当前串口已切换为二进制协议");
-        }
-        return false;
-    }
-    if (!serial_.isOpen()) {
-        if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("串口未打开");
-        }
-        return false;
-    }
-
-    QByteArray data = line.toUtf8();
-    if (!data.endsWith('\n')) {
-        data.append("\r\n");
-    }
-
-    const qint64 written = serial_.write(data);
-    if (written != data.size()) {
-        if (errorMessage != nullptr) {
-            *errorMessage = serial_.errorString();
-        }
-        return false;
-    }
-
-    return true;
 }
 
 bool SerialClient::sendBinaryFrame(
@@ -107,43 +75,14 @@ bool SerialClient::sendBinaryFrame(
     return true;
 }
 
-void SerialClient::setBinaryMode(bool enabled) {
-    binaryMode_ = enabled;
-    rxBuffer_.clear();
-    binaryParser_.reset();
-}
-
-bool SerialClient::binaryMode() const {
-    return binaryMode_;
-}
-
 void SerialClient::handleReadyRead() {
-    if (binaryMode_) {
-        QString parserError;
-        const auto frames = binaryParser_.feed(serial_.readAll(), &parserError);
-        for (const auto& frame : frames) {
-            emit binaryFrameReceived(frame);
-        }
-        if (!parserError.isEmpty()) {
-            emit errorOccurred(QStringLiteral("二进制协议: %1").arg(parserError));
-        }
-        return;
+    QString parserError;
+    const auto frames = binaryParser_.feed(serial_.readAll(), &parserError);
+    for (const auto& frame : frames) {
+        emit binaryFrameReceived(frame);
     }
-
-    rxBuffer_.append(serial_.readAll());
-
-    while (true) {
-        const int lf = rxBuffer_.indexOf('\n');
-        if (lf < 0) {
-            break;
-        }
-
-        QByteArray line = rxBuffer_.left(lf);
-        rxBuffer_.remove(0, lf + 1);
-        if (line.endsWith('\r')) {
-            line.chop(1);
-        }
-        emit lineReceived(QString::fromUtf8(line));
+    if (!parserError.isEmpty()) {
+        emit errorOccurred(QStringLiteral("二进制协议: %1").arg(parserError));
     }
 }
 

@@ -12,6 +12,3 @@ bool ILineTransport::sendBinaryFrame(
     }
     return false;
 }
-
-void ILineTransport::setBinaryMode(bool) {
-}

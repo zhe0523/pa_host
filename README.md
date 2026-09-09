@@ -30,9 +30,9 @@ src/ImageSession.*   当前图像帧、显示渲染和算法调用的应用层�
 src/FramePresentationController.* 最新帧选择、显示限速、实际 FPS 和丢帧统计
 src/ReplayPresentationScheduler.* 1～120 fps 显示时间调度策略
 src/PaDeviceController.* RS422 设备状态、命令生命周期、响应和超时管理
-src/ILineTransport.* 控制链路的按行传输接口，支持模拟传输测试
-src/SerialClient.*   RS422 串口按行收发
-src/PaProtocol.*     研发调试用 ASCII 命令和响应解析
+src/ILineTransport.* 控制链路的二进制帧传输接口，支持模拟传输测试
+src/SerialClient.*   RS422 串口二进制帧收发
+src/PaProtocol.*     业务命令枚举和界面显示名称
 src/PaBinaryProtocol.* RS422 正式二进制帧、CRC 和拆包/粘包解析
 src/TiRawImage.*     Windows 样例 .tiraw 16-bit 灰度图读取、自动窗宽窗位、ROI 统计
 src/ImageView.*      图像显示、缩放、平移、ROI 框选、保存
@@ -211,31 +211,29 @@ pa_image_benchmark 真实 TiRaw 性能基准工具
 `MainWindow` 只负责模块组装和跨模块工作流：图像列表内部行为由 `ImageListPanel` 管理，文件编码由 `ImageExportService` 管理，客户上图按钮由 `ImageTransferWorkflowController` 管理，图像源启停和会话统计由 `ImageAcquisitionController` 管理，显示限速由 `FramePresentationController` 管理，纯时间计算由 `ReplayPresentationScheduler` 管理。主窗口不直接依赖具体 MTF 或窗宽窗位实现，而是通过 `IImageAlgorithms` 调用。后续拿到旧软件算法源码后，新增接口实现并在程序启动时注入即可。详细边界见 `doc/architecture.md`。
 
 RS422 控制链路由 `PaDeviceController` 管理连接状态、单条在途命令、响应和超时。
-主机默认使用兼容 ASCII 调试模式；正式联调必须使用 `--binary`，此时串口收发全部是
-下位机正式二进制帧，主机不会把命令回退成 ASCII。设备返回有效响应、发生超时或传输错误后，
+主机固定使用正式 RS422 二进制协议，串口收发不会回退到文本协议。设备返回有效响应、发生超时或传输错误后，
 控制器会统一恢复或切换错误状态。
 
 ### RS422 正式二进制联调
 
-ARM 端的正式入口是 `pa_controller --binary`，不是 `--stdio`。`--stdio` 只用于在开发板上
-测试 ASCII 调试命令；ASCII 命令和正式上位机协议不是同一套接口。
+ARM 端默认入口就是正式二进制协议（无需附加参数）。
 
 下位机先在 Ubuntu/Kylin 上编译并部署，然后在开发板运行：
 
 ```sh
-./pa_controller --binary -d /dev/ttyS1 -b 115200
+./pa_controller -d /dev/ttyS1 -b 115200
 ```
 
 主机端运行：
 
 ```sh
-./pa_host --binary
+./pa_host
 ```
 
 Windows 下对应为：
 
 ```bat
-pa_host.exe --binary
+pa_host.exe
 ```
 
 打开主机后选择实际 RS422 端口和波特率，点击连接。连接成功后主机会自动发送一次二进制
@@ -379,34 +377,6 @@ Kylin 新服务器使用 WCH RS422 串口，默认端口为 `/dev/ttyWCH0`，允
 
 ```sh
 sudo stty -F /dev/ttyWCH0 115200 raw -echo -echoe -echok -echoctl -echoke -crtscts -ixon -ixoff
-```
-
-## 与 ARM 的当前协议
-
-当前按 `pa_controller` 的临时 ASCII 行协议开发，命令以 `\r\n` 结束：
-
-```text
-PING
-STATUS
-LOAD_TEMPLATE
-MAKE_OFFSET
-MAKE_GAIN
-CONFIG_TEMPLATE
-START_CORR
-SEND_SINGLE
-START_CONTINUOUS
-STOP_TRANSFER
-```
-
-`SEND_SINGLE`、`START_CONTINUOUS` 和 `STOP_TRANSFER` 分别对应单帧、持续启动和停止当前传输。
-模式按钮本身不属于通信协议，不发送命令。
-
-响应示例：
-
-```text
-OK PONG
-OK STATUS int_vector=0x00000000 pa_version=0x00000000 com_version=0x00000000 rst_state=0x00000000 wr_state=0 wr_end=0 corr_state=0 corr_end=0
-ERR UNKNOWN
 ```
 
 ## 图像格式

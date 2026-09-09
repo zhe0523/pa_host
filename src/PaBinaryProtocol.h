@@ -7,8 +7,7 @@
 /*
  * PA Controller 正式二进制协议基础层。
  *
- * 当前 Qt 工程仍默认使用 ASCII 调试协议；本类先独立提供与 ARM 端一致的
- * 帧编解码和串口字节流重同步，后续由业务控制器选择传输模式。
+ * 提供与 ARM 端一致的帧编解码和串口字节流重同步。
  */
 class PaBinaryProtocol final {
 public:

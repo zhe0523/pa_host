@@ -9,7 +9,7 @@
  * RS422 串口客户端。
  *
  * RS422 在 Linux 上通常表现为普通 tty 设备，例如 /dev/ttyS1、/dev/ttyUSB0。
- * 这个类只处理串口打开、关闭、按行收发；协议含义交给 PaProtocol。
+ * 这个类只处理串口打开、关闭和二进制帧收发。
  */
 class SerialClient final : public ILineTransport {
     Q_OBJECT
@@ -22,10 +22,7 @@ public:
     bool isOpen() const override;
     QString portName() const override;
 
-    bool sendLine(const QString& line, QString* errorMessage) override;
     bool sendBinaryFrame(const PaBinaryProtocol::Frame& frame, QString* errorMessage) override;
-    void setBinaryMode(bool enabled) override;
-    bool binaryMode() const;
 
 private slots:
     void handleReadyRead();
@@ -33,7 +30,5 @@ private slots:
 
 private:
     QSerialPort serial_;
-    QByteArray rxBuffer_; // 未凑齐一整行的接收缓存
     PaBinaryProtocol::StreamParser binaryParser_;
-    bool binaryMode_ = false;
 };
